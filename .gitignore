@@ -25,4 +25,16 @@ iscsi-test-suite/obj/
 iscsi-test-suite/iscsi-test-suite
 iscsi-test-suite/simple_test
 iscsi-test-suite/reports/*.txt
-iscsi-test-suite/reports/*.txt
+
+# C test binaries (compiled from examples/c_tests/)
+capture_sense_data
+debug_large_transfer
+debug_test
+simple_test
+test_pdu_ser
+test_pdu_serialization
+test_tc008_debug
+
+# Test output files
+*.log
+test_output.*
