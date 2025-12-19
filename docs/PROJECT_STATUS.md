@@ -46,74 +46,68 @@
 - ✅ **Capacity Management**: Configurable size
 - ✅ **Block Operations**: 512-byte blocks
 
+### CHAP Authentication
+- ✅ **Auth Module**: Complete implementation in `src/auth.rs`
+- ✅ **One-way CHAP**: Challenge-response authentication
+- ✅ **Mutual CHAP**: Two-way authentication support
+- ✅ **MD5 Algorithm**: RFC 1994 compliant
+- ✅ **Session Integration**: Fully integrated with login phase
+- ✅ **Examples**: chap_target.rs, mutual_chap_target.rs
+- ✅ **Testing**: Verified with Linux open-iscsi
+
+See: `CHAP_IMPLEMENTATION.md` for details
+
 ---
 
 ## In Progress 🔄
 
-### CHAP Authentication (Microsoft Certification)
-- ✅ Auth module structure (`src/auth.rs`)
-- ✅ Challenge generation and validation
-- ✅ MD5 algorithm implementation
-- ✅ Constant-time comparison
-- 🔄 Session integration (next step)
-- ⏳ Target builder integration
-- ⏳ Example updates
-- ⏳ Windows/Linux testing
-
-See: `CHAP_IMPLEMENTATION.md` for details
+Currently: Testing and documentation updates
 
 ---
 
 ## Planned Features 📋
 
 ### High Priority
-1. **CHAP Authentication** (in progress)
-   - Required for Microsoft Windows certification
-   - One-way and mutual CHAP support
-   - ETA: Current sprint
-
-2. **File-Backed Storage**
+1. **File-Backed Storage**
    - Persistent storage using regular files
    - Support for sparse files
    - Direct I/O for performance
-   - ETA: Next sprint
 
-3. **Multiple LUNs**
+2. **Multiple LUNs**
    - Support multiple logical units per target
    - LUN routing and management
-   - ETA: After file storage
 
 ### Medium Priority
-4. **Error Recovery**
+3. **Error Recovery**
    - Command retry logic
    - Session recovery after disconnect
    - Target cold reset handling
 
-5. **Performance Optimization**
+4. **Performance Optimization**
    - Async I/O operations
    - Connection pooling
    - Read-ahead caching
 
-6. **Extended SCSI Commands**
+5. **Extended SCSI Commands**
    - WRITE SAME
    - UNMAP (thin provisioning)
    - COMPARE AND WRITE
    - VERIFY
 
 ### Lower Priority
-7. **Advanced Features**
+6. **Advanced Features**
    - Multiple connections per session
    - Error Recovery Level > 0
    - Header/Data digests (CRC32C)
    - Immediate data + unsolicited data
    - Bidirectional commands
 
-8. **Management**
+7. **Management**
    - Runtime configuration
    - Statistics and monitoring
    - Dynamic target creation/removal
 
-9. **Additional Authentication**
+8. **Additional Authentication**
    - SRP (Secure Remote Password)
    - Kerberos
    - IPsec integration
@@ -141,30 +135,35 @@ See: `CHAP_IMPLEMENTATION.md` for details
 
 ## Recent Changes
 
-### Latest Commit (b3dac01)
-**Fix write operations by handling immediate data and enabling writes**
+### Latest Commit (4139c39)
+**Cleanup and organization improvements**
 
-Key changes:
-- Set `initial_r2t=false` to allow immediate data
-- Implement immediate data handling in SCSI Command PDU
-- Detect WRITE commands by opcode
-- Extract LBA from WRITE command CDB
-- Handle SYNCHRONIZE CACHE with mutable device access
-- Fix handle_scsi_data_out to use stored LBA
+Recent refactoring:
+- Removed compiled binaries from git tracking
+- Organized documentation into logical structure
+- Organized scripts into logical directories (testing, setup, tools)
+- Added comprehensive test scripts
+- Updated integration test suite with proper error reporting
 
-Tests passing:
-- Direct writes with dd and fsync (0.002s)
-- Partition creation with fdisk
-- ext2 filesystem creation and mounting
-- File I/O with data integrity verification
+Core implementation completed:
+- Write operations with immediate data and multi-PDU support
+- CHAP authentication (one-way and mutual)
+- Discovery sessions (SendTargets)
+- Full SCSI command set for block operations
+- RFC 3720 status code compliance
+
+Test status:
+- 55 unit tests passing, 0 failures
+- Integration tests verified with Linux open-iscsi
+- Real-world filesystem operations validated
 
 ---
 
 ## Microsoft Windows Certification Progress
 
 ### Requirements
-- ⏳ CHAP authentication support (in progress - 60% complete)
-- ⏳ Mutual CHAP support (planned)
+- ✅ CHAP authentication support (complete)
+- ✅ Mutual CHAP support (complete)
 - ⏳ Windows Initiator compatibility testing (pending)
 - ✅ SCSI command set (complete)
 - ✅ Write operations (complete)
@@ -231,40 +230,41 @@ hex = "0.4"        # Hex encoding
 
 ---
 
-## Next Sprint Tasks
+## Next Steps
 
-1. **Complete CHAP Integration** (Priority: HIGH)
-   - Add AuthConfig to IscsiSession
-   - Implement CHAP parameter exchange
-   - Add authentication validation
-   - Update target builder
-   - Create examples
+1. **Windows Initiator Testing** (Priority: HIGH)
+   - Test with Windows iSCSI Initiator
+   - Verify CHAP authentication on Windows
+   - Test mutual CHAP on Windows
+   - Performance benchmarks on Windows
 
-2. **Testing** (Priority: HIGH)
-   - Test with Linux open-iscsi + CHAP
-   - Test with Windows Initiator
-   - Verify mutual CHAP
-   - Stress testing
-
-3. **File-Backed Storage** (Priority: MEDIUM)
+2. **File-Backed Storage** (Priority: HIGH)
    - Design file storage backend
    - Implement ScsiBlockDevice for files
    - Add sparse file support
+   - Direct I/O support
    - Benchmark performance
 
-4. **Documentation** (Priority: MEDIUM)
-   - Update README with CHAP examples
+3. **Additional Testing** (Priority: MEDIUM)
+   - Stress testing with concurrent connections
+   - Long-running stability tests
+   - Error recovery testing
+   - Performance profiling
+
+4. **Documentation Improvements** (Priority: MEDIUM)
    - Add configuration guide
    - Document Windows setup
+   - Add performance tuning guide
+   - Create deployment guide
 
 ---
 
 ## Long-Term Roadmap
 
-### Phase 1: Core Features (Current)
+### Phase 1: Core Features (Complete)
 - iSCSI protocol basics ✅
 - Write operations ✅
-- CHAP authentication 🔄
+- CHAP authentication ✅
 
 ### Phase 2: Production Ready
 - File-backed storage
@@ -294,4 +294,4 @@ hex = "0.4"        # Hex encoding
 
 ---
 
-Last Updated: 2025-12-07
+Last Updated: 2025-12-19

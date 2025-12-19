@@ -190,24 +190,33 @@ sudo iscsiadm -m node -T iqn.2025-12.local:storage.secure-disk -p 127.0.0.1:3260
 - `Cargo.toml`: Add dependencies
 
 ### New Files
-- `src/auth.rs`: Complete CHAP implementation
-- `examples/chap_target.rs`: (pending) CHAP example
-- `CHAP_IMPLEMENTATION.md`: This file
+- ✅ `src/auth.rs`: Complete CHAP implementation
+- ✅ `examples/chap_target.rs`: One-way CHAP example
+- ✅ `examples/mutual_chap_target.rs`: Mutual CHAP example
+- ✅ `CHAP_IMPLEMENTATION.md`: This file
 
-### Files to Modify
-- `src/session.rs`: Add CHAP negotiation logic
-- `src/target.rs`: Pass AuthConfig to sessions
-- `examples/simple_target.rs`: Update with optional auth
+### Files Modified
+- ✅ `src/session.rs`: CHAP negotiation logic added
+- ✅ `src/target.rs`: AuthConfig passed to sessions
+- ✅ `Cargo.toml`: Dependencies added (md5, rand, hex)
+
+## Implementation Complete
+
+All tasks completed:
+
+1. ✅ Add `AuthConfig` field to `IscsiSession`
+2. ✅ Implement CHAP parameter exchange in `handle_login`
+3. ✅ Add authentication validation before Full Feature Phase
+4. ✅ Update `IscsiTargetBuilder` with `auth_config()` method
+5. ✅ Create CHAP examples (one-way and mutual)
+6. ✅ Test with Linux open-iscsi initiator
+7. ✅ Document configuration in README.md
 
 ## Next Steps
 
-1. Add `AuthConfig` field to `IscsiSession`
-2. Implement CHAP parameter exchange in `handle_login`
-3. Add authentication validation before Full Feature Phase
-4. Update `IscsiTargetBuilder` with `with_auth()` method
-5. Create CHAP examples
-6. Test with Linux and Windows initiators
-7. Document configuration in README.md
+- Test with Windows iSCSI initiator
+- Performance testing with CHAP enabled
+- Stress testing with authentication
 
 ## Notes
 

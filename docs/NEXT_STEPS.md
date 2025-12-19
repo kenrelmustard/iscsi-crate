@@ -28,10 +28,16 @@ This document provides a quick-start guide for resuming work on the iscsi-target
 - ✓ Multi-threaded connection handling
 - ✓ Login and full feature phase handling
 - ✓ SCSI command processing with Data-In/Out
-- ✓ 51 unit tests passing
+- ✓ 55 unit tests passing
+- ✓ CHAP authentication (one-way and mutual)
+- ✓ Discovery sessions (SendTargets)
+- ✓ Linux open-iscsi initiator testing complete
 
 **What's Next:**
-Test with real iSCSI initiators (Phase 5) - Linux, Windows, ESXi.
+- Windows iSCSI initiator testing
+- ESXi iSCSI initiator testing (optional)
+- File-backed storage implementation
+- Performance optimization
 
 ## Where to Start
 
@@ -86,19 +92,9 @@ iscsicli LoginTarget iqn.2025-12.local:storage.disk1 T 127.0.0.1 3260 * * * * * 
 
 ## Testing Approach
 
-### During Development
+### Real Initiator Testing
 
-Create a test initiator in `examples/test_initiator.rs`:
-
-```rust
-// Simple client that sends login request
-// Validates server responses
-// Tests basic SCSI commands
-```
-
-### After Basic Implementation
-
-Test with real initiators:
+Test with actual iSCSI initiator software:
 
 **Linux:**
 ```bash
