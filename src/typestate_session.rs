@@ -12,6 +12,31 @@
 //!                                           v
 //!                                        Failed
 //! ```
+//!
+//! ## Security Verification
+//!
+//! The typestate pattern provides **compile-time** enforcement of the login state machine:
+//!
+//! 1. **Private `_state` field**: The `TypestateSession<S>` struct has a private `_state: PhantomData<S>`
+//!    field, which prevents external code from directly constructing sessions in arbitrary states.
+//!    Attempting to bypass authentication by directly creating `TypestateSession<FullFeaturePhase>`
+//!    results in: `error[E0451]: field '_state' of struct 'TypestateSession' is private`
+//!
+//! 2. **State-specific methods**: Methods like `process_nop_out()` and `process_logout()` only exist
+//!    on `TypestateSession<FullFeaturePhase>`. Calling them on other states is a compile-time error.
+//!
+//! 3. **Sealed trait pattern**: The `SessionState` trait uses a private `Sealed` supertrait,
+//!    preventing external code from implementing custom states.
+//!
+//! 4. **Consuming transitions**: State transitions consume `self` and return new typed sessions,
+//!    ensuring the old state cannot be reused after a transition.
+//!
+//! ### AnySession Runtime Wrapper
+//!
+//! The `AnySession` enum provides runtime dispatch for cases where dynamic state handling is needed
+//! (e.g., storing sessions in collections). While this adds runtime checks, it maintains safety by:
+//! - Returning `Err` for invalid operations rather than allowing undefined behavior
+//! - Delegating to the type-safe `TypestateSession<S>` methods internally
 
 use crate::auth::{parse_chap_response, AuthConfig, ChapAuthState};
 use crate::error::{IscsiError, ScsiResult};
