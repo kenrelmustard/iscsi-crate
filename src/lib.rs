@@ -53,6 +53,7 @@ pub mod pdu;
 pub mod scsi;
 pub mod session;
 pub mod target;
+pub mod typestate_session;
 
 pub use auth::{AuthConfig, ChapCredentials};
 pub use client::IscsiClient;
