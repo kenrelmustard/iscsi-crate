@@ -711,8 +711,9 @@ fn handle_scsi_data_out<D: ScsiBlockDevice>(
     }
 
     // Transfer not complete yet - check if we need to send next R2T
-    // (respecting MaxOutstandingR2T=1 by only sending R2T after receiving DATA-OUT)
-    if pending.next_r2t_offset < pending.expected_data_len {
+    // (respecting MaxOutstandingR2T=1 by only sending R2T after ALL data from previous R2T received)
+    // Only send next R2T if we've received data up to where the next R2T should start
+    if pending.bytes_received >= pending.next_r2t_offset && pending.next_r2t_offset < pending.expected_data_len {
         let max_burst = data.params.max_burst_length;
         let remaining = pending.expected_data_len - pending.next_r2t_offset;
         let request_len = remaining.min(max_burst);
