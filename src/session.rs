@@ -147,6 +147,10 @@ pub struct PendingWrite {
     pub lun: u64,
     /// Buffer to accumulate data from multiple DATA-OUT PDUs
     pub buffer: Vec<u8>,
+    /// Next offset to request via R2T (respects MaxOutstandingR2T)
+    pub next_r2t_offset: u32,
+    /// Total expected data length
+    pub expected_data_len: u32,
 }
 
 /// iSCSI Session

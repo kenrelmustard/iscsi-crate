@@ -1,0 +1,13 @@
+{
+  "schema_version": "1.0",
+  "session_id": "90c168df-cb08-43a1-a712-205b3a3ae7cd",
+  "timestamp": "2026-01-06T12:49:19.442196933+00:00",
+  "machine_id": "roob",
+  "project_dir": "/home/matt/Git/iscsi-crate",
+  "git": {
+    "remote": "git@github.com:lawless-m/iscsi-crate.git",
+    "branch": "master",
+    "commit": "83a693738c21002159163c5bac4d774589851b7f"
+  },
+  "conversation": []
+}

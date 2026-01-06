@@ -556,36 +556,32 @@ fn handle_write_command<D: ScsiBlockDevice>(
         }
 
         let ttt = data.next_target_transfer_tag();
+        let max_burst = data.params.max_burst_length;
+
+        // Only send ONE R2T initially (respect MaxOutstandingR2T=1)
+        let remaining = expected_data_len as u32 - bytes_received;
+        let request_len = remaining.min(max_burst);
+        let next_offset = bytes_received + request_len;
+
         data.pending_writes.insert(cmd.itt, PendingWrite {
             lba, transfer_length, block_size, bytes_received, ttt, r2t_sn: 0, lun: cmd.lun,
             buffer,
+            next_r2t_offset: next_offset,
+            expected_data_len: expected_data_len as u32,
         });
 
-        // Send R2T to request remaining data
-        let max_burst = data.params.max_burst_length;
-        let mut responses = Vec::new();
-        let mut offset = bytes_received;
-        let mut r2t_sn = 0u32;
-
-        while offset < expected_data_len as u32 {
-            let remaining = expected_data_len as u32 - offset;
-            let request_len = remaining.min(max_burst);
-
-            responses.push(IscsiPdu::r2t(
-                cmd.lun, cmd.itt, ttt, data.stat_sn,
-                data.exp_cmd_sn, data.max_cmd_sn,
-                r2t_sn, offset, request_len,
-            ));
-
-            offset += request_len;
-            r2t_sn += 1;
-        }
+        // Send only the first R2T
+        let r2t = IscsiPdu::r2t(
+            cmd.lun, cmd.itt, ttt, data.stat_sn,
+            data.exp_cmd_sn, data.max_cmd_sn,
+            0, bytes_received, request_len,
+        );
 
         if let Some(pending) = data.pending_writes.get_mut(&cmd.itt) {
-            pending.r2t_sn = r2t_sn;
+            pending.r2t_sn = 1;
         }
 
-        return Ok(responses);
+        return Ok(vec![r2t]);
     }
 
     Ok(vec![IscsiPdu::scsi_response(
@@ -714,7 +710,33 @@ fn handle_scsi_data_out<D: ScsiBlockDevice>(
         )]);
     }
 
-    // Transfer not complete yet, no response needed
+    // Transfer not complete yet - check if we need to send next R2T
+    // (respecting MaxOutstandingR2T=1 by only sending R2T after receiving DATA-OUT)
+    if pending.next_r2t_offset < pending.expected_data_len {
+        let max_burst = data.params.max_burst_length;
+        let remaining = pending.expected_data_len - pending.next_r2t_offset;
+        let request_len = remaining.min(max_burst);
+        let current_offset = pending.next_r2t_offset;
+        let r2t_sn = pending.r2t_sn;
+        let ttt = pending.ttt;
+        let lun = pending.lun;
+        let itt = data_out.itt;
+
+        // Update pending write state
+        pending.next_r2t_offset += request_len;
+        pending.r2t_sn += 1;
+
+        // Send next R2T
+        let r2t = IscsiPdu::r2t(
+            lun, itt, ttt, data.stat_sn,
+            data.exp_cmd_sn, data.max_cmd_sn,
+            r2t_sn, current_offset, request_len,
+        );
+
+        return Ok(vec![r2t]);
+    }
+
+    // All R2Ts sent, waiting for more DATA-OUT PDUs
     Ok(vec![])
 }
 
