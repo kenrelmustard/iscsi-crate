@@ -531,8 +531,9 @@ fn handle_write_command<D: ScsiBlockDevice>(
         let expected_data_len = transfer_length as usize * block_size as usize;
         let bytes_received = pdu.data.len() as u32;
 
-        // Write immediate data
-        if !pdu.data.is_empty() {
+        // Check if this is a single-PDU write (all data fits in immediate data)
+        if bytes_received as usize == expected_data_len {
+            // Single-PDU write - write directly
             let mut device_guard = device.lock().map_err(|_| IscsiError::Scsi("Device lock poisoned".to_string()))?;
             if let Err(e) = device_guard.write(lba, &pdu.data, block_size) {
                 log::error!("Write failed: {}", e);
@@ -542,22 +543,25 @@ fn handle_write_command<D: ScsiBlockDevice>(
                     pdu::scsi_status::CHECK_CONDITION, 0, 0, Some(&sense.to_bytes()),
                 )]);
             }
-        }
-
-        // Check if complete
-        if bytes_received as usize == expected_data_len {
             return Ok(vec![IscsiPdu::scsi_response(
                 cmd.itt, data.next_stat_sn(), data.exp_cmd_sn, data.max_cmd_sn,
                 pdu::scsi_status::GOOD, 0, 0, None,
             )]);
         }
 
-        // Need R2T for more data
+        // Multi-PDU write - create buffer and copy immediate data
+        let mut buffer = vec![0u8; expected_data_len];
+        if !pdu.data.is_empty() {
+            buffer[..pdu.data.len()].copy_from_slice(&pdu.data);
+        }
+
         let ttt = data.next_target_transfer_tag();
         data.pending_writes.insert(cmd.itt, PendingWrite {
             lba, transfer_length, block_size, bytes_received, ttt, r2t_sn: 0, lun: cmd.lun,
+            buffer,
         });
 
+        // Send R2T to request remaining data
         let max_burst = data.params.max_burst_length;
         let mut responses = Vec::new();
         let mut offset = bytes_received;
@@ -662,39 +666,47 @@ fn handle_scsi_data_out<D: ScsiBlockDevice>(
     let pending = pending.unwrap();
     let block_size = pending.block_size;
     let transfer_length = pending.transfer_length;
-    let base_lba = pending.lba;
+    let lba = pending.lba;
     let total_expected = transfer_length * block_size;
 
-    let lba = base_lba + (data_out.buffer_offset as u64 / block_size as u64);
+    // Copy data into buffer at the correct offset
+    let start_offset = data_out.buffer_offset as usize;
+    let end_offset = start_offset + data_out.data.len();
 
-    let mut device_guard = device.lock().map_err(|_| IscsiError::Scsi("Device lock poisoned".to_string()))?;
-    let write_result = device_guard.write(lba, &data_out.data, block_size);
-    drop(device_guard);
-
-    let end_offset = data_out.buffer_offset + data_out.data.len() as u32;
-    if end_offset > pending.bytes_received {
-        pending.bytes_received = end_offset;
+    if end_offset > pending.buffer.len() {
+        log::error!("DATA-OUT offset {} + len {} exceeds buffer size {}",
+            data_out.buffer_offset, data_out.data.len(), pending.buffer.len());
+        let sense = crate::scsi::SenseData::medium_error();
+        return Ok(vec![IscsiPdu::scsi_response(
+            data_out.itt, data.next_stat_sn(), data.exp_cmd_sn, data.max_cmd_sn,
+            pdu::scsi_status::CHECK_CONDITION, 0, 0, Some(&sense.to_bytes()),
+        )]);
     }
 
-    let (status, sense) = match write_result {
-        Ok(()) => (scsi_status::GOOD, None),
-        Err(e) => {
-            log::error!("Write failed: {}", e);
-            (pdu::scsi_status::CHECK_CONDITION, Some(crate::scsi::SenseData::medium_error().to_bytes()))
-        }
-    };
+    pending.buffer[start_offset..end_offset].copy_from_slice(&data_out.data);
 
+    if end_offset as u32 > pending.bytes_received {
+        pending.bytes_received = end_offset as u32;
+    }
+
+    // Check if transfer is complete
     if pending.bytes_received >= total_expected {
         let itt = data_out.itt;
+        let buffer = pending.buffer.clone();
         data.pending_writes.remove(&itt);
 
-        return Ok(vec![IscsiPdu::scsi_response(
-            itt, data.next_stat_sn(), data.exp_cmd_sn, data.max_cmd_sn,
-            status, 0, 0, sense.as_deref(),
-        )]);
-    } else if status != scsi_status::GOOD {
-        let itt = data_out.itt;
-        data.pending_writes.remove(&itt);
+        // Now write the complete buffer to the device in one operation
+        let mut device_guard = device.lock().map_err(|_| IscsiError::Scsi("Device lock poisoned".to_string()))?;
+        let write_result = device_guard.write(lba, &buffer, block_size);
+        drop(device_guard);
+
+        let (status, sense) = match write_result {
+            Ok(()) => (scsi_status::GOOD, None),
+            Err(e) => {
+                log::error!("Write failed: {}", e);
+                (pdu::scsi_status::CHECK_CONDITION, Some(crate::scsi::SenseData::medium_error().to_bytes()))
+            }
+        };
 
         return Ok(vec![IscsiPdu::scsi_response(
             itt, data.next_stat_sn(), data.exp_cmd_sn, data.max_cmd_sn,
@@ -702,6 +714,7 @@ fn handle_scsi_data_out<D: ScsiBlockDevice>(
         )]);
     }
 
+    // Transfer not complete yet, no response needed
     Ok(vec![])
 }
 

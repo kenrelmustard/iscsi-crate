@@ -145,6 +145,8 @@ pub struct PendingWrite {
     pub r2t_sn: u32,
     /// LUN for this command
     pub lun: u64,
+    /// Buffer to accumulate data from multiple DATA-OUT PDUs
+    pub buffer: Vec<u8>,
 }
 
 /// iSCSI Session
