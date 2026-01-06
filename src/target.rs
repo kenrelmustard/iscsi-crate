@@ -207,7 +207,15 @@ fn handle_connection<D: ScsiBlockDevice>(
     );
 
     let mut session_entered = false;
-    let target_address = local_addr.to_string();
+
+    // Fix bind address 0.0.0.0 -> actual reachable address
+    let target_address = if local_addr.ip().is_unspecified() {
+        // If bound to 0.0.0.0, use localhost for discovery
+        // TODO: Use actual server IP or make this configurable
+        format!("127.0.0.1:{}", local_addr.port())
+    } else {
+        local_addr.to_string()
+    };
 
     // Main connection loop
     while running.load(Ordering::SeqCst) {
@@ -720,11 +728,11 @@ fn handle_text_request(
 
     let response_data = serialize_text_parameters(&response_params);
 
-    let data = session.data().ok_or_else(|| IscsiError::Protocol("No session data".to_string()))?;
+    let data = session.data_mut().ok_or_else(|| IscsiError::Protocol("No session data".to_string()))?;
 
     let response = IscsiPdu::text_response(
         text_req.itt, 0xFFFF_FFFF,
-        data.stat_sn, data.exp_cmd_sn, data.max_cmd_sn,
+        data.next_stat_sn(), data.exp_cmd_sn, data.max_cmd_sn,
         true, response_data,
     );
 

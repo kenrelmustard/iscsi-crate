@@ -158,6 +158,7 @@ pub struct SessionData {
     pub chap_state: Option<ChapAuthState>,
     pub target_chap_state: Option<ChapAuthState>,
     pub chap_completed: bool,
+    pub none_auth_negotiated: bool,
     pub allowed_initiators: Option<Vec<String>>,
 }
 
@@ -181,6 +182,7 @@ impl Default for SessionData {
             chap_state: None,
             target_chap_state: None,
             chap_completed: false,
+            none_auth_negotiated: false,
             allowed_initiators: None,
         }
     }
@@ -480,13 +482,31 @@ impl TypestateSession<Free> {
             return Ok((AnySession::Failed(self.into_failed()), vec![response]));
         }
 
-        // Transition to SecurityNegotiation and continue processing
-        let security_session: TypestateSession<SecurityNegotiation> = TypestateSession {
-            data: self.data,
-            _state: PhantomData,
-        };
-
-        security_session.continue_login(pdu, target_name)
+        // Transition to appropriate state based on client's CSG
+        match login.csg {
+            0 => {
+                // Client wants SecurityNegotiation
+                let security_session: TypestateSession<SecurityNegotiation> = TypestateSession {
+                    data: self.data,
+                    _state: PhantomData,
+                };
+                security_session.continue_login(pdu, target_name)
+            }
+            1 => {
+                // Client wants to skip SecurityNegotiation and go to LoginOperationalNegotiation
+                let login_session: TypestateSession<LoginOperationalNegotiation> = TypestateSession {
+                    data: self.data,
+                    _state: PhantomData,
+                };
+                login_session.process_login(pdu, target_name)
+            }
+            _ => {
+                // Invalid CSG
+                log::warn!("Login rejected: invalid CSG {} in initial login", login.csg);
+                let response = self.data.create_login_reject(itt, pdu::login_status::INITIATOR_ERROR, 0x02);
+                Ok((AnySession::Failed(self.into_failed()), vec![response]))
+            }
+        }
     }
 
     fn into_failed(self) -> TypestateSession<Failed> {
@@ -612,22 +632,23 @@ impl TypestateSession<SecurityNegotiation> {
                     Ok((AnySession::FullFeaturePhase(new_session), vec![response]))
                 }
                 _ => {
-                    // Stay in current state
+                    // Invalid state transition - reject with our current stage
                     self.data.stat_sn = self.data.stat_sn.wrapping_add(1);
                     let response = IscsiPdu::login_response(
                         self.data.isid, self.data.tsih, self.data.stat_sn,
                         self.data.exp_cmd_sn, self.data.max_cmd_sn,
-                        0, 0, login.csg, login.nsg, false, itt, vec![],
+                        0, 0, 0, 1, false, itt, vec![],  // CSG=0 (SecurityNegotiation), NSG=1
                     );
                     Ok((AnySession::SecurityNegotiation(self), vec![response]))
                 }
             }
         } else {
+            // No transit - report our current stage
             self.data.stat_sn = self.data.stat_sn.wrapping_add(1);
             let response = IscsiPdu::login_response(
                 self.data.isid, self.data.tsih, self.data.stat_sn,
                 self.data.exp_cmd_sn, self.data.max_cmd_sn,
-                0, 0, login.csg, login.nsg, false, itt, vec![],
+                0, 0, 0, 0, false, itt, vec![],  // CSG=0, NSG=0 (stay in SecurityNegotiation)
             );
             Ok((AnySession::SecurityNegotiation(self), vec![response]))
         }
@@ -639,7 +660,14 @@ impl TypestateSession<SecurityNegotiation> {
 
         match &self.data.auth_config {
             AuthConfig::None => {
+                // If we've already negotiated None auth, don't send the response again
+                if self.data.none_auth_negotiated {
+                    return Ok((true, vec![]));
+                }
+
                 if auth_method.is_some() {
+                    // Mark that we've negotiated None auth
+                    self.data.none_auth_negotiated = true;
                     Ok((true, vec![("AuthMethod".to_string(), "None".to_string())]))
                 } else {
                     Ok((true, vec![]))
@@ -775,11 +803,12 @@ impl TypestateSession<LoginOperationalNegotiation> {
             };
             Ok((AnySession::FullFeaturePhase(new_session), vec![response]))
         } else {
+            // No transit - report our current stage
             self.data.stat_sn = self.data.stat_sn.wrapping_add(1);
             let response = IscsiPdu::login_response(
                 self.data.isid, self.data.tsih, self.data.stat_sn,
                 self.data.exp_cmd_sn, self.data.max_cmd_sn,
-                0, 0, login.csg, login.nsg, false, itt, vec![],
+                0, 0, 1, 1, false, itt, vec![],  // CSG=1, NSG=1 (stay in LoginOperationalNegotiation)
             );
             Ok((AnySession::LoginOperationalNegotiation(self), vec![response]))
         }
