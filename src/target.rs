@@ -422,7 +422,7 @@ fn handle_scsi_command<D: ScsiBlockDevice>(
     let cmd = pdu.parse_scsi_command()?;
     let data = session.data_mut().ok_or_else(|| IscsiError::Protocol("Session not in FullFeaturePhase".to_string()))?;
 
-    log::warn!(
+    log::debug!(
         "SCSI Command: CDB[0]=0x{:02x}, LUN=0x{:016x}, ITT=0x{:08x}, ExpLen={}, read={}, write={}, final={}, data_len={}",
         cmd.cdb[0], cmd.lun, cmd.itt, cmd.expected_data_length, cmd.read, cmd.write, cmd.final_flag, pdu.data.len()
     );
@@ -883,6 +883,939 @@ impl<D: ScsiBlockDevice> IscsiTargetBuilder<D> {
             max_sessions: self.max_sessions.unwrap_or(256),
             active_sessions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             allowed_initiators: self.allowed_initiators,
+        })
+    }
+}
+
+// ============================================================================
+// Multi-Target iSCSI Server
+// ============================================================================
+
+/// Target configuration for multi-target server
+struct TargetInfo {
+    device: Arc<Mutex<Box<dyn ScsiBlockDevice + Send>>>,
+    alias: String,
+    auth_config: crate::auth::AuthConfig,
+    allowed_initiators: Option<Vec<String>>,
+}
+
+/// Multi-target iSCSI server
+///
+/// Serves multiple targets on a single port with IQN-based routing
+pub struct IscsiServer {
+    bind_addr: String,
+    targets: Arc<Mutex<std::collections::HashMap<String, TargetInfo>>>,
+    running: Arc<AtomicBool>,
+    shutting_down: Arc<AtomicBool>,
+    max_connections: u32,
+    active_connections: Arc<std::sync::atomic::AtomicUsize>,
+    max_sessions: u32,
+    active_sessions: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl IscsiServer {
+    /// Create a new builder for configuring the server
+    pub fn builder() -> IscsiServerBuilder {
+        IscsiServerBuilder::new()
+    }
+
+    /// Run the multi-target iSCSI server
+    ///
+    /// This blocks the current thread and processes incoming connections.
+    pub fn run(&self) -> ScsiResult<()> {
+        let targets = self.targets.lock().unwrap();
+        let target_count = targets.len();
+        drop(targets);
+
+        log::info!("Multi-target iSCSI server starting on {}", self.bind_addr);
+        log::info!("Serving {} target(s)", target_count);
+
+        let listener = TcpListener::bind(&self.bind_addr)
+            .map_err(IscsiError::Io)?;
+
+        listener.set_nonblocking(true)
+            .map_err(IscsiError::Io)?;
+
+        self.running.store(true, Ordering::SeqCst);
+
+        log::info!("iSCSI server listening on {}", self.bind_addr);
+
+        while self.running.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((stream, addr)) => {
+                    log::info!("New connection from {}", addr);
+
+                    // Check connection limit
+                    let current = self.active_connections.fetch_add(1, Ordering::SeqCst);
+                    if current >= self.max_connections as usize {
+                        log::warn!("Connection rejected from {}: too many connections ({}/{})",
+                            addr, current + 1, self.max_connections);
+                        self.active_connections.fetch_sub(1, Ordering::SeqCst);
+                        let _ = send_connection_limit_reject(stream);
+                        continue;
+                    }
+
+                    log::debug!("Accepted connection from {} ({}/{} active)",
+                        addr, current + 1, self.max_connections);
+
+                    let targets = Arc::clone(&self.targets);
+                    let running = Arc::clone(&self.running);
+                    let shutting_down = Arc::clone(&self.shutting_down);
+                    let active_connections = Arc::clone(&self.active_connections);
+                    let max_sessions = self.max_sessions;
+                    let active_sessions = Arc::clone(&self.active_sessions);
+                    let bind_addr = self.bind_addr.clone();
+
+                    thread::spawn(move || {
+                        let session_entered = handle_multi_target_connection(
+                            stream,
+                            targets,
+                            &bind_addr,
+                            running,
+                            shutting_down,
+                            max_sessions,
+                            Arc::clone(&active_sessions),
+                        ).unwrap_or(false);
+
+                        log::info!("Connection closed from {}", addr);
+
+                        active_connections.fetch_sub(1, Ordering::SeqCst);
+
+                        if session_entered {
+                            active_sessions.fetch_sub(1, Ordering::SeqCst);
+                        }
+                    });
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => {
+                    log::error!("Accept error: {}", e);
+                }
+            }
+        }
+
+        log::info!("Multi-target iSCSI server shutting down");
+        Ok(())
+    }
+
+    /// Get the current number of active connections
+    pub fn active_connection_count(&self) -> usize {
+        self.active_connections.load(Ordering::SeqCst)
+    }
+
+    /// Get the current number of active sessions
+    pub fn active_session_count(&self) -> usize {
+        self.active_sessions.load(Ordering::SeqCst)
+    }
+
+    /// Initiate graceful shutdown
+    pub fn shutdown_gracefully(&self) {
+        log::info!("Initiating graceful shutdown - new logins will be rejected");
+        self.shutting_down.store(true, Ordering::SeqCst);
+    }
+
+    /// Signal the server to stop immediately
+    pub fn stop(&self) {
+        log::info!("Stopping multi-target iSCSI server");
+        self.running.store(false, Ordering::SeqCst);
+    }
+
+    /// Check if the server is running
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+
+    /// Check if the server is in graceful shutdown mode
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::SeqCst)
+    }
+}
+
+/// Handle a connection with multi-target routing
+fn handle_multi_target_connection(
+    mut stream: TcpStream,
+    targets: Arc<Mutex<std::collections::HashMap<String, TargetInfo>>>,
+    bind_addr: &str,
+    running: Arc<AtomicBool>,
+    shutting_down: Arc<AtomicBool>,
+    max_sessions: u32,
+    active_sessions: Arc<std::sync::atomic::AtomicUsize>,
+) -> ScsiResult<bool> {
+    let local_addr = stream.local_addr().map_err(IscsiError::Io)?;
+    stream.set_nonblocking(false).map_err(IscsiError::Io)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).map_err(IscsiError::Io)?;
+    stream.set_write_timeout(Some(Duration::from_secs(5))).map_err(IscsiError::Io)?;
+
+    let target_address = match local_addr {
+        std::net::SocketAddr::V4(addr) => addr.ip().to_string(),
+        std::net::SocketAddr::V6(addr) => format!("[{}]", addr.ip()),
+    };
+
+    // Create initial session for login phase
+    let mut session = AnySession::new();
+    let mut session_entered = false;
+
+    // Read first PDU to extract target name
+    let first_pdu = match read_pdu(&mut stream) {
+        Ok(pdu) => pdu,
+        Err(e) => {
+            log::error!("Failed to read first PDU: {}", e);
+            return Ok(false);
+        }
+    };
+
+    // Must be a login request
+    if first_pdu.opcode != opcode::LOGIN_REQUEST {
+        log::warn!("First PDU is not login request: 0x{:02x}", first_pdu.opcode);
+        return Ok(false);
+    }
+
+    // Parse login request to extract TargetName
+    let login_req = first_pdu.parse_login_request()?;
+    let target_name = login_req.parameters.iter()
+        .find(|(k, _)| k == "TargetName")
+        .map(|(_, v)| v.as_str());
+
+    // Check if this is a discovery session (no TargetName)
+    let is_discovery = target_name.is_none() || matches!(target_name, Some(""));
+
+    if is_discovery {
+        log::info!("Discovery session - returning all targets");
+        // Handle discovery session - returns all targets via SendTargets
+        return handle_discovery_session(stream, targets, &target_address, first_pdu);
+    }
+
+    let target_name = target_name.unwrap();
+    log::info!("Login request for target: {}", target_name);
+
+    // Look up target
+    let targets_lock = targets.lock().unwrap();
+    let target_info = match targets_lock.get(target_name) {
+        Some(info) => info,
+        None => {
+            log::warn!("Target not found: {}", target_name);
+            // Send login reject - target not found
+            let data = SessionData::default();
+            let reject_pdu = data.create_login_reject(
+                first_pdu.itt,
+                pdu::login_status::TARGET_ERROR,
+                0x02, // Target not found
+            );
+            let _ = write_pdu(&mut stream, &reject_pdu);
+            return Ok(false);
+        }
+    };
+
+    let device = Arc::clone(&target_info.device);
+    let alias = target_info.alias.clone();
+    let auth_config = target_info.auth_config.clone();
+    let allowed_initiators = target_info.allowed_initiators.clone();
+    drop(targets_lock);
+
+    log::info!("Routing to target: {} ({})", target_name, alias);
+
+    // Now handle the connection with the specific target
+    // Replay the first PDU through the normal handler
+    session_entered = handle_connection_with_first_pdu_boxed(
+        stream,
+        device,
+        target_name,
+        &alias,
+        auth_config,
+        running,
+        shutting_down,
+        max_sessions,
+        active_sessions,
+        allowed_initiators,
+        first_pdu,
+    )?;
+
+    Ok(session_entered)
+}
+
+/// Handle discovery session (SessionType=Discovery)
+fn handle_discovery_session(
+    mut stream: TcpStream,
+    targets: Arc<Mutex<std::collections::HashMap<String, TargetInfo>>>,
+    target_address: &str,
+    first_pdu: IscsiPdu,
+) -> ScsiResult<bool> {
+    let mut session = AnySession::new();
+
+    // Process login normally but without device access
+    let (new_session, responses) = session.process_login(&first_pdu, "")?;
+    session = new_session;
+
+    for response in responses {
+        write_pdu(&mut stream, &response)?;
+    }
+
+    // Wait for text request with SendTargets
+    loop {
+        let pdu = match read_pdu(&mut stream) {
+            Ok(pdu) => pdu,
+            Err(_) => break,
+        };
+
+        match pdu.opcode {
+            opcode::TEXT_REQUEST => {
+                let text_req = pdu.parse_text_request()?;
+                let is_send_targets = text_req.parameters.iter()
+                    .any(|(k, v)| k == "SendTargets" && (v == "All" || v.is_empty()));
+
+                if is_send_targets {
+                    // Build response with all targets
+                    let targets_lock = targets.lock().unwrap();
+                    let mut response_params = Vec::new();
+
+                    for (iqn, _) in targets_lock.iter() {
+                        response_params.push(("TargetName".to_string(), iqn.clone()));
+                        response_params.push(("TargetAddress".to_string(), format!("{},1", target_address)));
+                    }
+                    drop(targets_lock);
+
+                    let response_data = serialize_text_parameters(&response_params);
+                    let data = session.data_mut().ok_or_else(|| IscsiError::Protocol("No session data".to_string()))?;
+                    let response_pdu = IscsiPdu::text_response(
+                        pdu.itt, 0xFFFF_FFFF,
+                        data.next_stat_sn(), data.exp_cmd_sn, data.max_cmd_sn,
+                        true, response_data,
+                    );
+                    write_pdu(&mut stream, &response_pdu)?;
+                } else {
+                    // Empty response
+                    let data = session.data_mut().ok_or_else(|| IscsiError::Protocol("No session data".to_string()))?;
+                    let response_pdu = IscsiPdu::text_response(
+                        pdu.itt, 0xFFFF_FFFF,
+                        data.next_stat_sn(), data.exp_cmd_sn, data.max_cmd_sn,
+                        true, vec![],
+                    );
+                    write_pdu(&mut stream, &response_pdu)?;
+                }
+            }
+            opcode::LOGOUT_REQUEST => {
+                let old_session = std::mem::replace(&mut session, AnySession::new());
+                let (new_session, response) = old_session.process_logout(&pdu)?;
+                session = new_session;
+                write_pdu(&mut stream, &response)?;
+                break;
+            }
+            _ => {
+                log::warn!("Unexpected opcode during discovery: 0x{:02x}", pdu.opcode);
+                break;
+            }
+        }
+    }
+
+    Ok(false) // Discovery session complete (not counted as active session)
+}
+
+/// Handle connection with a specific target, replaying the first PDU
+fn handle_connection_with_first_pdu<D: ScsiBlockDevice>(
+    mut stream: TcpStream,
+    device: Arc<Mutex<D>>,
+    target_name: &str,
+    target_alias: &str,
+    auth_config: crate::auth::AuthConfig,
+    running: Arc<AtomicBool>,
+    shutting_down: Arc<AtomicBool>,
+    max_sessions: u32,
+    active_sessions: Arc<std::sync::atomic::AtomicUsize>,
+    allowed_initiators: Option<Vec<String>>,
+    first_pdu: IscsiPdu,
+) -> ScsiResult<bool> {
+    // Similar to handle_connection but with first PDU already read
+    let local_addr = stream.local_addr().map_err(IscsiError::Io)?;
+    let target_address = match local_addr {
+        std::net::SocketAddr::V4(addr) => addr.ip().to_string(),
+        std::net::SocketAddr::V6(addr) => format!("[{}]", addr.ip()),
+    };
+
+    let mut session = AnySession::new();
+    let mut session_entered = false;
+
+    // Process the first PDU (login request)
+    let (new_session, responses) = session.process_login(&first_pdu, target_name)?;
+    session = new_session;
+
+    for response in responses {
+        write_pdu(&mut stream, &response)?;
+    }
+
+    // Continue with normal connection handling
+    // (This is the same logic as handle_connection, continuing after first login PDU)
+    loop {
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let pdu = match read_pdu(&mut stream) {
+            Ok(pdu) => pdu,
+            Err(e) => {
+                if matches!(e, IscsiError::Io(ref io_e) if io_e.kind() == std::io::ErrorKind::TimedOut) {
+                    continue;
+                }
+                log::debug!("Error reading PDU: {}", e);
+                break;
+            }
+        };
+
+        // Check if shutting down and reject new logins
+        if shutting_down.load(Ordering::SeqCst) && pdu.opcode == opcode::LOGIN_REQUEST {
+            let data = SessionData::default();
+            let reject_pdu = data.create_login_reject(pdu.itt, pdu::login_status::INITIATOR_ERROR, 0x01);
+            let _ = write_pdu(&mut stream, &reject_pdu);
+            break;
+        }
+
+        // Check session limit before entering full feature phase
+        if !session_entered && pdu.opcode == opcode::LOGIN_REQUEST {
+            let current_sessions = active_sessions.load(Ordering::SeqCst);
+            if current_sessions >= max_sessions as usize {
+                log::warn!("Session limit reached ({}/{})", current_sessions, max_sessions);
+                let data = SessionData::default();
+                let reject_pdu = data.create_login_reject(pdu.itt, pdu::login_status::INITIATOR_ERROR, 0x01);
+                let _ = write_pdu(&mut stream, &reject_pdu);
+                break;
+            }
+        }
+
+        let was_full_feature = session.is_full_feature();
+
+        let responses = if session.is_login_phase() {
+            handle_login_phase(&mut session, &pdu, target_name, &target_address, &shutting_down, max_sessions, &active_sessions)?
+        } else if session.is_full_feature() {
+            handle_full_feature_phase(&mut session, &pdu, &device, target_name, &target_address)?
+        } else {
+            log::info!("Session ended (state: {})", session.state_name());
+            break;
+        };
+
+        // Detect transition to FullFeaturePhase
+        if !was_full_feature && session.is_full_feature() {
+            session_entered = true;
+            active_sessions.fetch_add(1, Ordering::SeqCst);
+        }
+
+        for response in responses {
+            write_pdu(&mut stream, &response)?;
+        }
+
+        // Logout is handled by handle_pdu
+    }
+
+    Ok(session_entered)
+}
+
+/// Boxed device version of handle_connection_with_first_pdu for multi-target server
+fn handle_connection_with_first_pdu_boxed(
+    mut stream: TcpStream,
+    device: Arc<Mutex<Box<dyn ScsiBlockDevice + Send>>>,
+    target_name: &str,
+    target_alias: &str,
+    auth_config: crate::auth::AuthConfig,
+    running: Arc<AtomicBool>,
+    shutting_down: Arc<AtomicBool>,
+    max_sessions: u32,
+    active_sessions: Arc<std::sync::atomic::AtomicUsize>,
+    allowed_initiators: Option<Vec<String>>,
+    first_pdu: IscsiPdu,
+) -> ScsiResult<bool> {
+    // Similar to handle_connection but with first PDU already read
+    let local_addr = stream.local_addr().map_err(IscsiError::Io)?;
+    let target_address = match local_addr {
+        std::net::SocketAddr::V4(addr) => addr.ip().to_string(),
+        std::net::SocketAddr::V6(addr) => format!("[{}]", addr.ip()),
+    };
+
+    let mut session = AnySession::new();
+    let mut session_entered = false;
+
+    // Process the first PDU (login request)
+    let (new_session, responses) = session.process_login(&first_pdu, target_name)?;
+    session = new_session;
+
+    for response in responses {
+        write_pdu(&mut stream, &response)?;
+    }
+
+    // Continue with normal connection handling
+    loop {
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let pdu = match read_pdu(&mut stream) {
+            Ok(pdu) => pdu,
+            Err(e) => {
+                if matches!(e, IscsiError::Io(ref io_e) if io_e.kind() == std::io::ErrorKind::TimedOut) {
+                    continue;
+                }
+                log::debug!("Error reading PDU: {}", e);
+                break;
+            }
+        };
+
+        // Check if shutting down and reject new logins
+        if shutting_down.load(Ordering::SeqCst) && pdu.opcode == opcode::LOGIN_REQUEST {
+            let data = SessionData::default();
+            let reject_pdu = data.create_login_reject(pdu.itt, pdu::login_status::INITIATOR_ERROR, 0x01);
+            let _ = write_pdu(&mut stream, &reject_pdu);
+            break;
+        }
+
+        // Check session limit before entering full feature phase
+        if !session_entered && pdu.opcode == opcode::LOGIN_REQUEST {
+            let current_sessions = active_sessions.load(Ordering::SeqCst);
+            if current_sessions >= max_sessions as usize {
+                log::warn!("Session limit reached ({}/{})", current_sessions, max_sessions);
+                let data = SessionData::default();
+                let reject_pdu = data.create_login_reject(pdu.itt, pdu::login_status::INITIATOR_ERROR, 0x01);
+                let _ = write_pdu(&mut stream, &reject_pdu);
+                break;
+            }
+        }
+
+        let responses = handle_pdu_multi_target(
+            &pdu,
+            &mut session,
+            &device,
+            target_name,
+            &target_address,
+            &mut stream,
+            &auth_config,
+            &allowed_initiators,
+            &mut session_entered,
+            &active_sessions,
+        )?;
+
+        for response in responses {
+            write_pdu(&mut stream, &response)?;
+        }
+
+        // Logout is handled by handle_pdu_multi_target
+    }
+
+    Ok(session_entered)
+}
+
+/// Handle a single PDU in multi-target mode
+fn handle_pdu_multi_target(
+    pdu: &IscsiPdu,
+    session: &mut AnySession,
+    device: &Arc<Mutex<Box<dyn ScsiBlockDevice + Send>>>,
+    target_name: &str,
+    target_address: &str,
+    stream: &mut TcpStream,
+    auth_config: &crate::auth::AuthConfig,
+    allowed_initiators: &Option<Vec<String>>,
+    session_entered: &mut bool,
+    active_sessions: &Arc<std::sync::atomic::AtomicUsize>,
+) -> ScsiResult<Vec<IscsiPdu>> {
+    match pdu.opcode {
+        opcode::LOGIN_REQUEST => {
+            // Track session entry
+            let was_in_full_feature = session.is_full_feature();
+
+            let old_session = std::mem::replace(session, AnySession::new());
+            let (new_session, responses) = old_session.process_login(pdu, target_name)?;
+            *session = new_session;
+
+            // If we just entered full feature phase, increment session count
+            if !was_in_full_feature && session.is_full_feature() {
+                *session_entered = true;
+                active_sessions.fetch_add(1, Ordering::SeqCst);
+                stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+                log::info!("Session entered FullFeaturePhase, increasing timeout");
+            }
+
+            Ok(responses)
+        }
+        opcode::TEXT_REQUEST => {
+            handle_text_request(session, pdu, target_name, target_address)
+        }
+        opcode::SCSI_COMMAND => {
+            handle_scsi_command_boxed(session, pdu, device)
+        }
+        opcode::SCSI_DATA_OUT => {
+            handle_scsi_data_out_boxed(session, pdu, device)
+        }
+        opcode::NOP_OUT => {
+            let response = session.process_nop_out(pdu)?;
+            Ok(vec![response])
+        }
+        opcode::LOGOUT_REQUEST => {
+            let old_session = std::mem::replace(session, AnySession::new());
+            let (new_session, response) = old_session.process_logout(pdu)?;
+            *session = new_session;
+            Ok(vec![response])
+        }
+        _ => {
+            log::warn!("Unhandled opcode: 0x{:02x}", pdu.opcode);
+            Ok(vec![])
+        }
+    }
+}
+
+/// Handle SCSI Command with boxed device
+/// This is a wrapper around the generic handle_scsi_command() that works with trait objects
+fn handle_scsi_command_boxed(
+    session: &mut AnySession,
+    pdu: &IscsiPdu,
+    device: &Arc<Mutex<Box<dyn ScsiBlockDevice + Send>>>,
+) -> ScsiResult<Vec<IscsiPdu>> {
+    let cmd = pdu.parse_scsi_command()?;
+    let data = session.data_mut().ok_or_else(|| IscsiError::Protocol("Session not in FullFeaturePhase".to_string()))?;
+
+    log::debug!(
+        "SCSI Command: CDB[0]=0x{:02x}, LUN=0x{:016x}, ITT=0x{:08x}, ExpLen={}, read={}, write={}, final={}, data_len={}",
+        cmd.cdb[0], cmd.lun, cmd.itt, cmd.expected_data_length, cmd.read, cmd.write, cmd.final_flag, pdu.data.len()
+    );
+
+    // Validate LUN
+    if cmd.lun != 0 {
+        log::warn!("Command 0x{:02x} to invalid LUN: 0x{:016x}", cmd.cdb[0], cmd.lun);
+        let sense = crate::scsi::SenseData::new(
+            crate::scsi::sense_key::ILLEGAL_REQUEST,
+            crate::scsi::asc::LOGICAL_UNIT_NOT_SUPPORTED,
+            0,
+        );
+        return Ok(vec![IscsiPdu::scsi_response(
+            cmd.itt, data.next_stat_sn(), data.exp_cmd_sn, data.max_cmd_sn,
+            pdu::scsi_status::CHECK_CONDITION, 0, 0, Some(&sense.to_bytes()),
+        )]);
+    }
+
+    // Validate CmdSN
+    let cmd_sn = BigEndian::read_u32(&pdu.specific[4..8]);
+    if !data.validate_cmd_sn(cmd_sn) {
+        log::warn!("Invalid CmdSN: {}, expected: {}", cmd_sn, data.exp_cmd_sn);
+    }
+
+    let opcode = cmd.cdb[0];
+    let is_sync_cache = opcode == 0x35 || opcode == 0x91;
+    let is_write_cmd = matches!(opcode, 0x0a | 0x2a | 0x8a);
+
+    // Handle WRITE commands
+    if is_write_cmd {
+        return handle_write_command_boxed(data, pdu, &cmd, device);
+    }
+
+    // Handle non-write commands
+    let response = if opcode == 0x03 {
+        // REQUEST SENSE
+        log::info!("REQUEST SENSE called");
+        if cmd.cdb.len() < 6 {
+            ScsiResponse::check_condition(crate::scsi::SenseData::invalid_command())
+        } else {
+            let alloc_len = cmd.cdb[4] as usize;
+            let mut sense_data = match &data.last_sense_data {
+                Some(bytes) => bytes.clone(),
+                None => crate::scsi::SenseData::new(
+                    crate::scsi::sense_key::NO_SENSE,
+                    crate::scsi::asc::NO_ADDITIONAL_SENSE,
+                    0,
+                ).to_bytes(),
+            };
+            sense_data.truncate(alloc_len.min(sense_data.len()));
+            ScsiResponse::good(sense_data)
+        }
+    } else if is_sync_cache {
+        let mut device_guard = device.lock().map_err(|_| IscsiError::Scsi("Device lock poisoned".to_string()))?;
+        device_guard.flush()?;
+        ScsiResponse::good_no_data()
+    } else {
+        let device_guard = device.lock().map_err(|_| IscsiError::Scsi("Device lock poisoned".to_string()))?;
+        ScsiHandler::handle_command(&cmd.cdb, &**device_guard, None)?
+    };
+
+    // Build response PDU(s)
+    build_scsi_response(data, &cmd, response)
+}
+
+/// Handle write command with boxed device
+fn handle_write_command_boxed(
+    data: &mut SessionData,
+    pdu: &IscsiPdu,
+    cmd: &ScsiCommandPdu,
+    device: &Arc<Mutex<Box<dyn ScsiBlockDevice + Send>>>,
+) -> ScsiResult<Vec<IscsiPdu>> {
+    let opcode = cmd.cdb[0];
+
+    let (lba, transfer_length) = match opcode {
+        0x0a | 0x2a => {
+            if opcode == 0x0a && cmd.cdb.len() >= 6 {
+                let lba_21 = ((cmd.cdb[1] as u32 & 0x1F) << 16)
+                           | ((cmd.cdb[2] as u32) << 8)
+                           | (cmd.cdb[3] as u32);
+                (lba_21 as u64, cmd.cdb[4] as u32)
+            } else if opcode == 0x2a && cmd.cdb.len() >= 10 {
+                let lba = BigEndian::read_u32(&cmd.cdb[2..6]) as u64;
+                let length = BigEndian::read_u16(&cmd.cdb[7..9]) as u32;
+                (lba, length)
+            } else {
+                (0, 0)
+            }
+        }
+        0x8a => {
+            if cmd.cdb.len() >= 16 {
+                let lba = BigEndian::read_u64(&cmd.cdb[2..10]);
+                let length = BigEndian::read_u32(&cmd.cdb[10..14]);
+                (lba, length)
+            } else {
+                (0, 0)
+            }
+        }
+        _ => (0, 0),
+    };
+
+    if transfer_length > 0 {
+        let device_guard = device.lock().map_err(|_| IscsiError::Scsi("Device lock poisoned".to_string()))?;
+        let block_size = device_guard.block_size();
+        drop(device_guard);
+
+        let expected_data_len = transfer_length as usize * block_size as usize;
+        let bytes_received = pdu.data.len() as u32;
+
+        // Check if this is a single-PDU write (all data fits in immediate data)
+        if bytes_received as usize == expected_data_len {
+            // Single-PDU write - write directly
+            let mut device_guard = device.lock().map_err(|_| IscsiError::Scsi("Device lock poisoned".to_string()))?;
+            if let Err(e) = device_guard.write(lba, &pdu.data, block_size) {
+                log::error!("Write failed: {}", e);
+                let sense = crate::scsi::SenseData::medium_error();
+                return Ok(vec![IscsiPdu::scsi_response(
+                    cmd.itt, data.next_stat_sn(), data.exp_cmd_sn, data.max_cmd_sn,
+                    pdu::scsi_status::CHECK_CONDITION, 0, 0, Some(&sense.to_bytes()),
+                )]);
+            }
+            return Ok(vec![IscsiPdu::scsi_response(
+                cmd.itt, data.next_stat_sn(), data.exp_cmd_sn, data.max_cmd_sn,
+                pdu::scsi_status::GOOD, 0, 0, None,
+            )]);
+        }
+
+        // Multi-PDU write - create buffer and copy immediate data
+        let mut buffer = vec![0u8; expected_data_len];
+        if !pdu.data.is_empty() {
+            buffer[..pdu.data.len()].copy_from_slice(&pdu.data);
+        }
+
+        let ttt = data.next_target_transfer_tag();
+        let max_burst = data.params.max_burst_length;
+
+        // Only send ONE R2T initially (respect MaxOutstandingR2T=1)
+        let remaining = expected_data_len as u32 - bytes_received;
+        let request_len = remaining.min(max_burst);
+        let next_offset = bytes_received + request_len;
+
+        data.pending_writes.insert(cmd.itt, PendingWrite {
+            lba, transfer_length, block_size, bytes_received, ttt, r2t_sn: 0, lun: cmd.lun,
+            buffer,
+            next_r2t_offset: next_offset,
+            expected_data_len: expected_data_len as u32,
+        });
+
+        // Send only the first R2T
+        let r2t = IscsiPdu::r2t(
+            cmd.lun, cmd.itt, ttt, data.stat_sn,
+            data.exp_cmd_sn, data.max_cmd_sn,
+            0, bytes_received, request_len,
+        );
+
+        if let Some(pending) = data.pending_writes.get_mut(&cmd.itt) {
+            pending.r2t_sn = 1;
+        }
+
+        return Ok(vec![r2t]);
+    }
+
+    Ok(vec![IscsiPdu::scsi_response(
+        cmd.itt, data.next_stat_sn(), data.exp_cmd_sn, data.max_cmd_sn,
+        pdu::scsi_status::GOOD, 0, 0, None,
+    )])
+}
+
+/// Handle SCSI Data-Out with boxed device
+fn handle_scsi_data_out_boxed(
+    session: &mut AnySession,
+    pdu: &IscsiPdu,
+    device: &Arc<Mutex<Box<dyn ScsiBlockDevice + Send>>>,
+) -> ScsiResult<Vec<IscsiPdu>> {
+    let data_out = pdu.parse_scsi_data_out()?;
+    let data = session.data_mut().ok_or_else(|| IscsiError::Protocol("Session not in FullFeaturePhase".to_string()))?;
+
+    let pending = data.pending_writes.get_mut(&data_out.itt);
+    if pending.is_none() {
+        log::warn!("Received Data-Out for unknown ITT=0x{:08x}", data_out.itt);
+        return Ok(vec![]);
+    }
+
+    let pending = pending.unwrap();
+    let block_size = pending.block_size;
+    let transfer_length = pending.transfer_length;
+    let lba = pending.lba;
+    let total_expected = transfer_length * block_size;
+
+    // Copy incoming data into pending buffer
+    let offset = data_out.buffer_offset as usize;
+    let data_len = pdu.data.len();
+    if offset + data_len > pending.buffer.len() {
+        log::error!("Data-Out overflow: offset={}, len={}, buffer={}", offset, data_len, pending.buffer.len());
+        return Ok(vec![]);
+    }
+
+    pending.buffer[offset..offset + data_len].copy_from_slice(&pdu.data);
+    pending.bytes_received += data_len as u32;
+
+    log::info!(
+        "Data-Out: ITT=0x{:08x}, offset={}, len={}, bytes_received={}/{}, final={}",
+        data_out.itt, offset, data_len, pending.bytes_received, total_expected, data_out.final_flag
+    );
+
+    // Handle final PDU
+    if data_out.final_flag {
+        if pending.bytes_received != total_expected {
+            log::error!("Incomplete write: received={}, expected={}", pending.bytes_received, total_expected);
+            data.pending_writes.remove(&data_out.itt);
+            let sense = crate::scsi::SenseData::medium_error();
+            return Ok(vec![IscsiPdu::scsi_response(
+                data_out.itt, data.next_stat_sn(), data.exp_cmd_sn, data.max_cmd_sn,
+                pdu::scsi_status::CHECK_CONDITION, 0, 0, Some(&sense.to_bytes()),
+            )]);
+        }
+
+        let pending = data.pending_writes.remove(&data_out.itt).unwrap();
+        let mut device_guard = device.lock().map_err(|_| IscsiError::Scsi("Device lock poisoned".to_string()))?;
+
+        if let Err(e) = device_guard.write(lba, &pending.buffer, block_size) {
+            log::error!("Write failed: {}", e);
+            let sense = crate::scsi::SenseData::medium_error();
+            return Ok(vec![IscsiPdu::scsi_response(
+                data_out.itt, data.next_stat_sn(), data.exp_cmd_sn, data.max_cmd_sn,
+                pdu::scsi_status::CHECK_CONDITION, 0, 0, Some(&sense.to_bytes()),
+            )]);
+        }
+
+        return Ok(vec![IscsiPdu::scsi_response(
+            data_out.itt, data.next_stat_sn(), data.exp_cmd_sn, data.max_cmd_sn,
+            pdu::scsi_status::GOOD, 0, 0, None,
+        )]);
+    }
+
+    // Not final - send next R2T if needed
+    let pending = data.pending_writes.get_mut(&data_out.itt).unwrap();
+    if pending.bytes_received < pending.expected_data_len {
+        let remaining = pending.expected_data_len - pending.bytes_received;
+        let max_burst = data.params.max_burst_length;
+        let request_len = remaining.min(max_burst);
+
+        let r2t = IscsiPdu::r2t(
+            pending.lun, data_out.itt, pending.ttt, data.stat_sn,
+            data.exp_cmd_sn, data.max_cmd_sn,
+            pending.r2t_sn, pending.bytes_received, request_len,
+        );
+
+        pending.r2t_sn += 1;
+        pending.next_r2t_offset = pending.bytes_received + request_len;
+
+        return Ok(vec![r2t]);
+    }
+
+    Ok(vec![])
+}
+
+/// Builder for configuring a multi-target iSCSI server
+pub struct IscsiServerBuilder {
+    bind_addr: Option<String>,
+    targets: std::collections::HashMap<String, (Box<dyn ScsiBlockDevice + Send>, String, crate::auth::AuthConfig, Option<Vec<String>>)>,
+    max_connections: Option<u32>,
+    max_sessions: Option<u32>,
+}
+
+impl IscsiServerBuilder {
+    fn new() -> Self {
+        Self {
+            bind_addr: None,
+            targets: std::collections::HashMap::new(),
+            max_connections: None,
+            max_sessions: None,
+        }
+    }
+
+    pub fn bind_addr(mut self, addr: &str) -> Self {
+        self.bind_addr = Some(addr.to_string());
+        self
+    }
+
+    pub fn add_target(
+        mut self,
+        iqn: String,
+        device: Box<dyn ScsiBlockDevice + Send>,
+        alias: Option<String>,
+    ) -> Self {
+        let alias = alias.unwrap_or_else(|| iqn.clone());
+        self.targets.insert(iqn, (device, alias, crate::auth::AuthConfig::None, None));
+        self
+    }
+
+    pub fn add_target_with_auth(
+        mut self,
+        iqn: String,
+        device: Box<dyn ScsiBlockDevice + Send>,
+        alias: Option<String>,
+        auth_config: crate::auth::AuthConfig,
+        allowed_initiators: Option<Vec<String>>,
+    ) -> Self {
+        let alias = alias.unwrap_or_else(|| iqn.clone());
+        self.targets.insert(iqn, (device, alias, auth_config, allowed_initiators));
+        self
+    }
+
+    pub fn max_connections(mut self, max: u32) -> Self {
+        self.max_connections = Some(max);
+        self
+    }
+
+    pub fn max_sessions(mut self, max: u32) -> Self {
+        self.max_sessions = Some(max);
+        self
+    }
+
+    pub fn build(self) -> ScsiResult<IscsiServer> {
+        if self.targets.is_empty() {
+            return Err(IscsiError::Config("At least one target must be configured".to_string()));
+        }
+
+        let bind_addr = self.bind_addr.unwrap_or_else(|| format!("0.0.0.0:{}", ISCSI_PORT));
+
+        // Convert to TargetInfo structs
+        let mut targets_map = std::collections::HashMap::new();
+        for (iqn, (device, alias, auth_config, allowed_initiators)) in self.targets {
+            if !iqn.starts_with("iqn.") && !iqn.starts_with("eui.") && !iqn.starts_with("naa.") {
+                return Err(IscsiError::Config(
+                    format!("Invalid IQN format: {}", iqn)
+                ));
+            }
+
+            targets_map.insert(iqn, TargetInfo {
+                device: Arc::new(Mutex::new(device)),
+                alias,
+                auth_config,
+                allowed_initiators,
+            });
+        }
+
+        Ok(IscsiServer {
+            bind_addr,
+            targets: Arc::new(Mutex::new(targets_map)),
+            running: Arc::new(AtomicBool::new(false)),
+            shutting_down: Arc::new(AtomicBool::new(false)),
+            max_connections: self.max_connections.unwrap_or(16),
+            active_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_sessions: self.max_sessions.unwrap_or(256),
+            active_sessions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 }
