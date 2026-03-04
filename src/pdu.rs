@@ -584,14 +584,14 @@ impl IscsiPdu {
         pdu.specific[12..16].copy_from_slice(&max_cmd_sn.to_be_bytes());
 
         // Add sense data if provided
-        // RFC 3720 Section 10.4.7 specifies a SenseLength field at bytes 36-37
+        // RFC 3720 Section 10.4.7: Data segment = [SenseLength (2 bytes)] [Sense Data]
         if let Some(sense) = sense_data {
-            // SenseLength at bytes 36-37 (specific[16..18])
             let sense_len = sense.len() as u16;
-            pdu.specific[16..18].copy_from_slice(&sense_len.to_be_bytes());
-
-            pdu.data = sense.to_vec();
-            pdu.data_length = pdu.data.len() as u32;
+            let mut data_segment = Vec::with_capacity(2 + sense.len());
+            data_segment.extend_from_slice(&sense_len.to_be_bytes());
+            data_segment.extend_from_slice(sense);
+            pdu.data_length = data_segment.len() as u32;
+            pdu.data = data_segment;
         }
 
         // Residual count at bytes 40-43 (specific[20..24])
