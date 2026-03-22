@@ -556,30 +556,36 @@ fn handle_write_command<D: ScsiBlockDevice>(
         }
 
         let ttt = data.next_target_transfer_tag();
-        let max_burst = data.params.max_burst_length;
-
-        // Only send ONE R2T initially (respect MaxOutstandingR2T=1)
-        let remaining = expected_data_len as u32 - bytes_received;
-        let request_len = remaining.min(max_burst);
-        let next_offset = bytes_received + request_len;
 
         data.pending_writes.insert(cmd.itt, PendingWrite {
             lba, transfer_length, block_size, bytes_received, ttt, r2t_sn: 0, lun: cmd.lun,
             buffer,
-            next_r2t_offset: next_offset,
+            next_r2t_offset: bytes_received,
             expected_data_len: expected_data_len as u32,
         });
 
-        // Send only the first R2T
+        // If F bit is clear, initiator will send unsolicited Data-Out PDUs
+        // (up to FirstBurstLength). Don't send R2T yet — wait for the
+        // unsolicited burst to complete (Data-Out handler sends R2T when needed).
+        if !cmd.final_flag {
+            return Ok(vec![]);
+        }
+
+        // F bit set — no more unsolicited data. Send R2T for remainder.
+        let max_burst = data.params.max_burst_length;
+        let remaining = expected_data_len as u32 - bytes_received;
+        let request_len = remaining.min(max_burst);
+
+        if let Some(pending) = data.pending_writes.get_mut(&cmd.itt) {
+            pending.next_r2t_offset = bytes_received + request_len;
+            pending.r2t_sn = 1;
+        }
+
         let r2t = IscsiPdu::r2t(
             cmd.lun, cmd.itt, ttt, data.stat_sn,
             data.exp_cmd_sn, data.max_cmd_sn,
             0, bytes_received, request_len,
         );
-
-        if let Some(pending) = data.pending_writes.get_mut(&cmd.itt) {
-            pending.r2t_sn = 1;
-        }
 
         return Ok(vec![r2t]);
     }
@@ -597,7 +603,7 @@ fn build_scsi_response(
 ) -> ScsiResult<Vec<IscsiPdu>> {
     let mut responses = Vec::new();
 
-    if cmd.read && !response.data.is_empty() {
+    if !response.data.is_empty() {
         let max_data_seg = data.params.max_xmit_data_segment_length as usize;
         let mut offset = 0u32;
         let mut data_sn = 0u32;
@@ -685,8 +691,9 @@ fn handle_scsi_data_out<D: ScsiBlockDevice>(
         pending.bytes_received = end_offset as u32;
     }
 
-    // Check if transfer is complete
-    if pending.bytes_received >= total_expected {
+    // Check if transfer is complete — require F bit to avoid completing
+    // while unsolicited Data-Out PDUs are still in flight
+    if data_out.final_flag && pending.bytes_received >= total_expected {
         let itt = data_out.itt;
         let buffer = pending.buffer.clone();
         data.pending_writes.remove(&itt);
@@ -708,6 +715,29 @@ fn handle_scsi_data_out<D: ScsiBlockDevice>(
             itt, data.next_stat_sn(), data.exp_cmd_sn, data.max_cmd_sn,
             status, 0, 0, sense.as_deref(),
         )]);
+    }
+
+    // F bit set but not enough data — need R2T for remainder
+    if data_out.final_flag && pending.bytes_received < total_expected {
+        let max_burst = data.params.max_burst_length;
+        let remaining = total_expected - pending.bytes_received;
+        let request_len = remaining.min(max_burst);
+        let current_offset = pending.bytes_received;
+        let r2t_sn = pending.r2t_sn;
+        let ttt = pending.ttt;
+        let lun = pending.lun;
+        let itt = data_out.itt;
+
+        pending.next_r2t_offset = current_offset + request_len;
+        pending.r2t_sn += 1;
+
+        let r2t = IscsiPdu::r2t(
+            lun, itt, ttt, data.stat_sn,
+            data.exp_cmd_sn, data.max_cmd_sn,
+            r2t_sn, current_offset, request_len,
+        );
+
+        return Ok(vec![r2t]);
     }
 
     // Transfer not complete yet - check if we need to send next R2T
@@ -1603,30 +1633,36 @@ fn handle_write_command_boxed(
         }
 
         let ttt = data.next_target_transfer_tag();
-        let max_burst = data.params.max_burst_length;
-
-        // Only send ONE R2T initially (respect MaxOutstandingR2T=1)
-        let remaining = expected_data_len as u32 - bytes_received;
-        let request_len = remaining.min(max_burst);
-        let next_offset = bytes_received + request_len;
 
         data.pending_writes.insert(cmd.itt, PendingWrite {
             lba, transfer_length, block_size, bytes_received, ttt, r2t_sn: 0, lun: cmd.lun,
             buffer,
-            next_r2t_offset: next_offset,
+            next_r2t_offset: bytes_received,
             expected_data_len: expected_data_len as u32,
         });
 
-        // Send only the first R2T
+        // If F bit is clear, initiator will send unsolicited Data-Out PDUs
+        // (up to FirstBurstLength). Don't send R2T yet — wait for the
+        // unsolicited burst to complete (Data-Out handler sends R2T when needed).
+        if !cmd.final_flag {
+            return Ok(vec![]);
+        }
+
+        // F bit set — no more unsolicited data. Send R2T for remainder.
+        let max_burst = data.params.max_burst_length;
+        let remaining = expected_data_len as u32 - bytes_received;
+        let request_len = remaining.min(max_burst);
+
+        if let Some(pending) = data.pending_writes.get_mut(&cmd.itt) {
+            pending.next_r2t_offset = bytes_received + request_len;
+            pending.r2t_sn = 1;
+        }
+
         let r2t = IscsiPdu::r2t(
             cmd.lun, cmd.itt, ttt, data.stat_sn,
             data.exp_cmd_sn, data.max_cmd_sn,
             0, bytes_received, request_len,
         );
-
-        if let Some(pending) = data.pending_writes.get_mut(&cmd.itt) {
-            pending.r2t_sn = 1;
-        }
 
         return Ok(vec![r2t]);
     }
