@@ -562,11 +562,12 @@ fn handle_write_command<D: ScsiBlockDevice>(
             buffer,
             next_r2t_offset: bytes_received,
             expected_data_len: expected_data_len as u32,
+            completed: false,
         });
 
-        // If F bit is clear, initiator will send unsolicited Data-Out PDUs
-        // (up to FirstBurstLength). Don't send R2T yet — wait for the
-        // unsolicited burst to complete (Data-Out handler sends R2T when needed).
+        // If F bit is clear, the initiator will send more unsolicited Data-Out
+        // PDUs. Don't send R2T yet — the Data-Out handler will send R2T for
+        // any remaining data after the unsolicited burst completes (F=true).
         if !cmd.final_flag {
             return Ok(vec![]);
         }
@@ -661,11 +662,18 @@ fn handle_scsi_data_out<D: ScsiBlockDevice>(
 
     let pending = data.pending_writes.get_mut(&data_out.itt);
     if pending.is_none() {
-        log::warn!("Received Data-Out for unknown ITT=0x{:08x}", data_out.itt);
+        log::debug!("Data-Out for unknown ITT=0x{:08x}, ignoring", data_out.itt);
+        return Ok(vec![]);
+    }
+    let pending = pending.unwrap();
+    if pending.completed {
+        log::debug!("Data-Out for completed ITT=0x{:08x}, absorbing", data_out.itt);
+        if data_out.final_flag {
+            data.pending_writes.remove(&data_out.itt);
+        }
         return Ok(vec![]);
     }
 
-    let pending = pending.unwrap();
     let block_size = pending.block_size;
     let transfer_length = pending.transfer_length;
     let lba = pending.lba;
@@ -691,12 +699,17 @@ fn handle_scsi_data_out<D: ScsiBlockDevice>(
         pending.bytes_received = end_offset as u32;
     }
 
+    log::debug!("Data-Out: ITT=0x{:08x} off={} len={} F={} recv={}/{} TTT=0x{:08x}",
+        data_out.itt, start_offset, data_out.data.len(), data_out.final_flag,
+        pending.bytes_received, total_expected, data_out.ttt);
+
     // Check if transfer is complete — require F bit to avoid completing
     // while unsolicited Data-Out PDUs are still in flight
     if data_out.final_flag && pending.bytes_received >= total_expected {
         let itt = data_out.itt;
+        log::debug!("Write complete: ITT=0x{:08x} bytes={}/{}", itt, pending.bytes_received, total_expected);
         let buffer = pending.buffer.clone();
-        data.pending_writes.remove(&itt);
+        pending.completed = true;
 
         // Now write the complete buffer to the device in one operation
         let mut device_guard = device.lock().map_err(|_| IscsiError::Scsi("Device lock poisoned".to_string()))?;
@@ -1639,11 +1652,12 @@ fn handle_write_command_boxed(
             buffer,
             next_r2t_offset: bytes_received,
             expected_data_len: expected_data_len as u32,
+            completed: false,
         });
 
-        // If F bit is clear, initiator will send unsolicited Data-Out PDUs
-        // (up to FirstBurstLength). Don't send R2T yet — wait for the
-        // unsolicited burst to complete (Data-Out handler sends R2T when needed).
+        // If F bit is clear, the initiator will send more unsolicited Data-Out
+        // PDUs. Don't send R2T yet — the Data-Out handler will send R2T for
+        // any remaining data after the unsolicited burst completes (F=true).
         if !cmd.final_flag {
             return Ok(vec![]);
         }
@@ -1684,11 +1698,18 @@ fn handle_scsi_data_out_boxed(
 
     let pending = data.pending_writes.get_mut(&data_out.itt);
     if pending.is_none() {
-        log::warn!("Received Data-Out for unknown ITT=0x{:08x}", data_out.itt);
+        log::debug!("Data-Out for unknown ITT=0x{:08x}, ignoring", data_out.itt);
+        return Ok(vec![]);
+    }
+    let pending = pending.unwrap();
+    if pending.completed {
+        log::debug!("Data-Out for completed ITT=0x{:08x}, absorbing", data_out.itt);
+        if data_out.final_flag {
+            data.pending_writes.remove(&data_out.itt);
+        }
         return Ok(vec![]);
     }
 
-    let pending = pending.unwrap();
     let block_size = pending.block_size;
     let transfer_length = pending.transfer_length;
     let lba = pending.lba;

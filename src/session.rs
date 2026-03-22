@@ -151,6 +151,8 @@ pub struct PendingWrite {
     pub next_r2t_offset: u32,
     /// Total expected data length
     pub expected_data_len: u32,
+    /// Write already completed — absorb stray Data-Out PDUs silently
+    pub completed: bool,
 }
 
 /// iSCSI Session
