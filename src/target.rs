@@ -208,14 +208,9 @@ fn handle_connection<D: ScsiBlockDevice>(
 
     let mut session_entered = false;
 
-    // Fix bind address 0.0.0.0 -> actual reachable address
-    let target_address = if local_addr.ip().is_unspecified() {
-        // If bound to 0.0.0.0, use localhost for discovery
-        // TODO: Use actual server IP or make this configurable
-        format!("127.0.0.1:{}", local_addr.port())
-    } else {
-        local_addr.to_string()
-    };
+    // Address for discovery responses. On a connected socket, local_addr
+    // resolves to the actual interface IP even when bound to 0.0.0.0.
+    let target_address = local_addr.to_string();
 
     // Clone stream for writer — reader thread handles NOP-Out directly
     let mut write_stream = stream.try_clone().map_err(IscsiError::Io)?;
@@ -233,7 +228,10 @@ fn handle_connection<D: ScsiBlockDevice>(
 
     // Channel for PDUs from reader thread to main processing loop
     let (pdu_tx, pdu_rx) = std::sync::mpsc::channel::<IscsiPdu>();
-    let reader_running = running.clone();
+    // Per-connection flag — don't use the global `running` to stop the reader,
+    // or closing one connection kills the whole target.
+    let conn_running = Arc::new(AtomicBool::new(true));
+    let reader_running = conn_running.clone();
     let nop_writer = nop_write_stream.clone();
 
     // Reader thread: reads PDUs, handles NOP-Out inline, forwards rest
@@ -346,8 +344,8 @@ fn handle_connection<D: ScsiBlockDevice>(
         }
     }
 
-    // Signal reader thread to stop and clean up
-    running.store(false, Ordering::SeqCst);
+    // Signal reader thread to stop and clean up (per-connection flag, not global)
+    conn_running.store(false, Ordering::SeqCst);
     let _ = write_stream.shutdown(Shutdown::Both);
     let _ = reader_handle.join();
     Ok(session_entered)
@@ -1227,7 +1225,7 @@ impl IscsiServer {
 fn handle_multi_target_connection(
     mut stream: TcpStream,
     targets: Arc<Mutex<std::collections::HashMap<String, TargetInfo>>>,
-    bind_addr: &str,
+    _bind_addr: &str,
     running: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
     max_sessions: u32,
@@ -1244,8 +1242,7 @@ fn handle_multi_target_connection(
     };
 
     // Create initial session for login phase
-    let mut session = AnySession::new();
-    let mut session_entered = false;
+    let _session = AnySession::new();
 
     // Read first PDU to extract target name
     let first_pdu = match read_pdu(&mut stream) {
@@ -1308,7 +1305,7 @@ fn handle_multi_target_connection(
 
     // Now handle the connection with the specific target
     // Replay the first PDU through the normal handler
-    session_entered = handle_connection_with_first_pdu_boxed(
+    let session_entered = handle_connection_with_first_pdu_boxed(
         stream,
         device,
         target_name,
@@ -1387,8 +1384,7 @@ fn handle_discovery_session(
             }
             opcode::LOGOUT_REQUEST => {
                 let old_session = std::mem::replace(&mut session, AnySession::new());
-                let (new_session, response) = old_session.process_logout(&pdu)?;
-                session = new_session;
+                let (_new_session, response) = old_session.process_logout(&pdu)?;
                 write_pdu(&mut stream, &response)?;
                 break;
             }
@@ -1402,109 +1398,12 @@ fn handle_discovery_session(
     Ok(false) // Discovery session complete (not counted as active session)
 }
 
-/// Handle connection with a specific target, replaying the first PDU
-fn handle_connection_with_first_pdu<D: ScsiBlockDevice>(
-    mut stream: TcpStream,
-    device: Arc<Mutex<D>>,
-    target_name: &str,
-    target_alias: &str,
-    auth_config: crate::auth::AuthConfig,
-    running: Arc<AtomicBool>,
-    shutting_down: Arc<AtomicBool>,
-    max_sessions: u32,
-    active_sessions: Arc<std::sync::atomic::AtomicUsize>,
-    allowed_initiators: Option<Vec<String>>,
-    first_pdu: IscsiPdu,
-) -> ScsiResult<bool> {
-    // Similar to handle_connection but with first PDU already read
-    let local_addr = stream.local_addr().map_err(IscsiError::Io)?;
-    let target_address = match local_addr {
-        std::net::SocketAddr::V4(addr) => addr.ip().to_string(),
-        std::net::SocketAddr::V6(addr) => format!("[{}]", addr.ip()),
-    };
-
-    let mut session = AnySession::new();
-    let mut session_entered = false;
-
-    // Process the first PDU (login request)
-    let (new_session, responses) = session.process_login(&first_pdu, target_name)?;
-    session = new_session;
-
-    for response in responses {
-        write_pdu(&mut stream, &response)?;
-    }
-
-    // Continue with normal connection handling
-    // (This is the same logic as handle_connection, continuing after first login PDU)
-    loop {
-        if !running.load(Ordering::SeqCst) {
-            break;
-        }
-
-        let pdu = match read_pdu(&mut stream) {
-            Ok(pdu) => pdu,
-            Err(e) => {
-                if matches!(e, IscsiError::Io(ref io_e) if io_e.kind() == std::io::ErrorKind::TimedOut) {
-                    continue;
-                }
-                log::debug!("Error reading PDU: {}", e);
-                break;
-            }
-        };
-
-        // Check if shutting down and reject new logins
-        if shutting_down.load(Ordering::SeqCst) && pdu.opcode == opcode::LOGIN_REQUEST {
-            let data = SessionData::default();
-            let reject_pdu = data.create_login_reject(pdu.itt, pdu::login_status::INITIATOR_ERROR, 0x01);
-            let _ = write_pdu(&mut stream, &reject_pdu);
-            break;
-        }
-
-        // Check session limit before entering full feature phase
-        if !session_entered && pdu.opcode == opcode::LOGIN_REQUEST {
-            let current_sessions = active_sessions.load(Ordering::SeqCst);
-            if current_sessions >= max_sessions as usize {
-                log::warn!("Session limit reached ({}/{})", current_sessions, max_sessions);
-                let data = SessionData::default();
-                let reject_pdu = data.create_login_reject(pdu.itt, pdu::login_status::INITIATOR_ERROR, 0x01);
-                let _ = write_pdu(&mut stream, &reject_pdu);
-                break;
-            }
-        }
-
-        let was_full_feature = session.is_full_feature();
-
-        let responses = if session.is_login_phase() {
-            handle_login_phase(&mut session, &pdu, target_name, &target_address, &shutting_down, max_sessions, &active_sessions)?
-        } else if session.is_full_feature() {
-            handle_full_feature_phase(&mut session, &pdu, &device, target_name, &target_address)?
-        } else {
-            log::info!("Session ended (state: {})", session.state_name());
-            break;
-        };
-
-        // Detect transition to FullFeaturePhase
-        if !was_full_feature && session.is_full_feature() {
-            session_entered = true;
-            active_sessions.fetch_add(1, Ordering::SeqCst);
-        }
-
-        for response in responses {
-            write_pdu(&mut stream, &response)?;
-        }
-
-        // Logout is handled by handle_pdu
-    }
-
-    Ok(session_entered)
-}
-
 /// Boxed device version of handle_connection_with_first_pdu for multi-target server
 fn handle_connection_with_first_pdu_boxed(
     mut stream: TcpStream,
     device: Arc<Mutex<Box<dyn ScsiBlockDevice + Send>>>,
     target_name: &str,
-    target_alias: &str,
+    _target_alias: &str,
     auth_config: crate::auth::AuthConfig,
     running: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
@@ -1599,8 +1498,8 @@ fn handle_pdu_multi_target(
     target_name: &str,
     target_address: &str,
     stream: &mut TcpStream,
-    auth_config: &crate::auth::AuthConfig,
-    allowed_initiators: &Option<Vec<String>>,
+    _auth_config: &crate::auth::AuthConfig,
+    _allowed_initiators: &Option<Vec<String>>,
     session_entered: &mut bool,
     active_sessions: &Arc<std::sync::atomic::AtomicUsize>,
 ) -> ScsiResult<Vec<IscsiPdu>> {
