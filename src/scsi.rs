@@ -269,6 +269,15 @@ impl ScsiHandler {
         device: &dyn ScsiBlockDevice,
         write_data: Option<&[u8]>,
     ) -> ScsiResult<ScsiResponse> {
+        Self::handle_command_with_target(cdb, device, write_data, None)
+    }
+
+    pub fn handle_command_with_target(
+        cdb: &[u8],
+        device: &dyn ScsiBlockDevice,
+        write_data: Option<&[u8]>,
+        target_name: Option<&str>,
+    ) -> ScsiResult<ScsiResponse> {
         if cdb.is_empty() {
             return Ok(ScsiResponse::check_condition(SenseData::invalid_command()));
         }
@@ -280,7 +289,7 @@ impl ScsiHandler {
 
         match ScsiOpcode::from_u8(opcode) {
             Some(ScsiOpcode::TestUnitReady) => Self::handle_test_unit_ready(),
-            Some(ScsiOpcode::Inquiry) => Self::handle_inquiry(cdb, device),
+            Some(ScsiOpcode::Inquiry) => Self::handle_inquiry(cdb, device, target_name),
             Some(ScsiOpcode::ReadCapacity10) => Self::handle_read_capacity_10(device),
             Some(ScsiOpcode::ServiceActionIn16) => Self::handle_service_action_in_16(cdb, device),
             Some(ScsiOpcode::Read10) => Self::handle_read_10(cdb, device),
@@ -313,7 +322,7 @@ impl ScsiHandler {
     }
 
     /// Handle INQUIRY (0x12)
-    fn handle_inquiry(cdb: &[u8], device: &dyn ScsiBlockDevice) -> ScsiResult<ScsiResponse> {
+    fn handle_inquiry(cdb: &[u8], device: &dyn ScsiBlockDevice, target_name: Option<&str>) -> ScsiResult<ScsiResponse> {
         if cdb.len() < 6 {
             return Ok(ScsiResponse::check_condition(SenseData::invalid_command()));
         }
@@ -324,7 +333,7 @@ impl ScsiHandler {
 
         if evpd != 0 {
             // VPD page request
-            return Self::handle_inquiry_vpd(page_code, alloc_len, device);
+            return Self::handle_inquiry_vpd(page_code, alloc_len, device, target_name);
         }
 
         // Standard INQUIRY response (36 bytes minimum)
@@ -388,7 +397,7 @@ impl ScsiHandler {
     }
 
     /// Handle INQUIRY VPD pages
-    fn handle_inquiry_vpd(page_code: u8, alloc_len: usize, _device: &dyn ScsiBlockDevice) -> ScsiResult<ScsiResponse> {
+    fn handle_inquiry_vpd(page_code: u8, alloc_len: usize, _device: &dyn ScsiBlockDevice, target_name: Option<&str>) -> ScsiResult<ScsiResponse> {
         match page_code {
             0x00 => {
                 // Supported VPD pages
@@ -408,15 +417,33 @@ impl ScsiHandler {
                 // Device Identification
                 let mut data = vec![0x00, 0x83, 0x00, 0x00]; // Header
 
-                // NAA descriptor
+                // NAA descriptor (binary, NAA type)
                 let naa_desc = [
                     0x01, 0x03, 0x00, 0x08, // Code set=binary, type=NAA, length=8
                     0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // NAA-6 identifier
                 ];
                 data.extend_from_slice(&naa_desc);
 
-                // Update page length
-                data[3] = (data.len() - 4) as u8;
+                // iSCSI target name descriptor (required for proper device identification)
+                if let Some(name) = target_name {
+                    let name_bytes = name.as_bytes();
+                    // Pad to 4-byte boundary
+                    let padded_len = (name_bytes.len() + 3) & !3;
+                    data.push(0x02); // Code set = ASCII
+                    data.push(0x05); // Association = target port, Designator type = SCSI name string
+                    data.push(0x00); // Reserved
+                    data.push(padded_len as u8); // Designator length
+                    data.extend_from_slice(name_bytes);
+                    // Pad with zeros
+                    for _ in name_bytes.len()..padded_len {
+                        data.push(0);
+                    }
+                }
+
+                // Update page length (2-byte big-endian at offset 2-3)
+                let page_len = data.len() - 4;
+                data[2] = (page_len >> 8) as u8;
+                data[3] = page_len as u8;
 
                 data.truncate(alloc_len.min(data.len()));
                 Ok(ScsiResponse::good(data))

@@ -384,7 +384,7 @@ fn handle_full_feature_phase<D: ScsiBlockDevice>(
 ) -> ScsiResult<Vec<IscsiPdu>> {
     match pdu.opcode {
         opcode::SCSI_COMMAND => {
-            handle_scsi_command(session, pdu, device)
+            handle_scsi_command(session, pdu, device, target_name)
         }
         opcode::SCSI_DATA_OUT => {
             handle_scsi_data_out(session, pdu, device)
@@ -418,6 +418,7 @@ fn handle_scsi_command<D: ScsiBlockDevice>(
     session: &mut AnySession,
     pdu: &IscsiPdu,
     device: &Arc<Mutex<D>>,
+    target_name: &str,
 ) -> ScsiResult<Vec<IscsiPdu>> {
     let cmd = pdu.parse_scsi_command()?;
     let data = session.data_mut().ok_or_else(|| IscsiError::Protocol("Session not in FullFeaturePhase".to_string()))?;
@@ -481,7 +482,7 @@ fn handle_scsi_command<D: ScsiBlockDevice>(
         ScsiResponse::good_no_data()
     } else {
         let device_guard = device.lock().map_err(|_| IscsiError::Scsi("Device lock poisoned".to_string()))?;
-        ScsiHandler::handle_command(&cmd.cdb, &*device_guard, None)?
+        ScsiHandler::handle_command_with_target(&cmd.cdb, &*device_guard, None, Some(target_name))?
     };
 
     // Build response PDU(s)
@@ -694,10 +695,7 @@ fn handle_scsi_data_out<D: ScsiBlockDevice>(
     }
 
     pending.buffer[start_offset..end_offset].copy_from_slice(&data_out.data);
-
-    if end_offset as u32 > pending.bytes_received {
-        pending.bytes_received = end_offset as u32;
-    }
+    pending.bytes_received += data_out.data.len() as u32;
 
     log::debug!("Data-Out: ITT=0x{:08x} off={} len={} F={} recv={}/{} TTT=0x{:08x}",
         data_out.itt, start_offset, data_out.data.len(), data_out.final_flag,
@@ -1479,7 +1477,7 @@ fn handle_pdu_multi_target(
             handle_text_request(session, pdu, target_name, target_address)
         }
         opcode::SCSI_COMMAND => {
-            handle_scsi_command_boxed(session, pdu, device)
+            handle_scsi_command_boxed(session, pdu, device, target_name)
         }
         opcode::SCSI_DATA_OUT => {
             handle_scsi_data_out_boxed(session, pdu, device)
@@ -1507,6 +1505,7 @@ fn handle_scsi_command_boxed(
     session: &mut AnySession,
     pdu: &IscsiPdu,
     device: &Arc<Mutex<Box<dyn ScsiBlockDevice + Send>>>,
+    target_name: &str,
 ) -> ScsiResult<Vec<IscsiPdu>> {
     let cmd = pdu.parse_scsi_command()?;
     let data = session.data_mut().ok_or_else(|| IscsiError::Protocol("Session not in FullFeaturePhase".to_string()))?;
@@ -1570,7 +1569,7 @@ fn handle_scsi_command_boxed(
         ScsiResponse::good_no_data()
     } else {
         let device_guard = device.lock().map_err(|_| IscsiError::Scsi("Device lock poisoned".to_string()))?;
-        ScsiHandler::handle_command(&cmd.cdb, &**device_guard, None)?
+        ScsiHandler::handle_command_with_target(&cmd.cdb, &**device_guard, None, Some(target_name))?
     };
 
     // Build response PDU(s)
