@@ -217,23 +217,70 @@ fn handle_connection<D: ScsiBlockDevice>(
         local_addr.to_string()
     };
 
-    // Main connection loop
-    while running.load(Ordering::SeqCst) {
-        let pdu = match read_pdu(&mut stream) {
-            Ok(pdu) => pdu,
-            Err(IscsiError::Io(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                log::debug!("Connection closed by initiator");
-                break;
-            }
-            Err(IscsiError::Io(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
+    // Clone stream for writer — reader thread handles NOP-Out directly
+    let mut write_stream = stream.try_clone().map_err(IscsiError::Io)?;
+    let nop_write_stream = std::sync::Arc::new(std::sync::Mutex::new(
+        stream.try_clone().map_err(IscsiError::Io)?
+    ));
+
+    // Channel for PDUs from reader thread to main processing loop
+    let (pdu_tx, pdu_rx) = std::sync::mpsc::channel::<IscsiPdu>();
+    let reader_running = running.clone();
+    let nop_writer = nop_write_stream.clone();
+
+    // Reader thread: reads PDUs, handles NOP-Out inline, forwards rest
+    let reader_handle = std::thread::spawn(move || {
+        while reader_running.load(Ordering::SeqCst) {
+            let pdu = match read_pdu(&mut stream) {
+                Ok(pdu) => pdu,
+                Err(IscsiError::Io(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    log::debug!("Connection closed by initiator");
+                    break;
+                }
+                Err(IscsiError::Io(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    continue;
+                }
+                Err(IscsiError::Io(ref e)) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    continue; // Don't close on timeout — just keep reading
+                }
+                Err(e) => {
+                    log::error!("Error reading PDU: {}", e);
+                    break;
+                }
+            };
+
+            // Handle NOP-Out directly in reader thread for fast response
+            if pdu.opcode == opcode::NOP_OUT {
+                log::debug!("NOP-Out received, responding inline");
+                // Build minimal NOP-In response
+                let mut resp = IscsiPdu::new();
+                resp.opcode = 0x20; // NOP-In
+                resp.flags = 0x80; // Final
+                resp.itt = pdu.itt;
+                resp.specific[0..4].copy_from_slice(&pdu.specific[0..4]); // TTT
+                // StatSN, ExpCmdSN, MaxCmdSN will be approximate but good enough for keepalive
+                if let Ok(mut writer) = nop_writer.lock() {
+                    let _ = write_pdu(&mut *writer, &resp);
+                }
                 continue;
             }
-            Err(IscsiError::Io(ref e)) if e.kind() == std::io::ErrorKind::TimedOut => {
+
+            if pdu_tx.send(pdu).is_err() {
+                break; // Main thread exited
+            }
+        }
+    });
+
+    // Main connection loop — processes PDUs from reader thread
+    while running.load(Ordering::SeqCst) {
+        let pdu = match pdu_rx.recv_timeout(Duration::from_secs(300)) {
+            Ok(pdu) => pdu,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 log::debug!("Connection timeout, closing");
                 break;
             }
-            Err(e) => {
-                log::error!("Error reading PDU: {}", e);
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                log::debug!("Reader thread exited");
                 break;
             }
         };
@@ -257,8 +304,6 @@ fn handle_connection<D: ScsiBlockDevice>(
         // Detect transition to FullFeaturePhase
         if !was_full_feature && session.is_full_feature() {
             log::info!("Session entered FullFeaturePhase, increasing timeout");
-            stream.set_read_timeout(Some(Duration::from_secs(300))).ok();
-            stream.set_write_timeout(Some(Duration::from_secs(30))).ok();
 
             session_entered = true;
             let count = active_sessions.fetch_add(1, Ordering::SeqCst);
@@ -268,7 +313,7 @@ fn handle_connection<D: ScsiBlockDevice>(
         // Send responses
         for resp_pdu in responses {
             log::debug!("Sending PDU: {} (opcode 0x{:02x})", resp_pdu.opcode_name(), resp_pdu.opcode);
-            write_pdu(&mut stream, &resp_pdu)?;
+            write_pdu(&mut write_stream, &resp_pdu)?;
         }
 
         // Check if session ended
@@ -278,7 +323,10 @@ fn handle_connection<D: ScsiBlockDevice>(
         }
     }
 
-    let _ = stream.shutdown(Shutdown::Both);
+    // Signal reader thread to stop and clean up
+    running.store(false, Ordering::SeqCst);
+    let _ = write_stream.shutdown(Shutdown::Both);
+    let _ = reader_handle.join();
     Ok(session_entered)
 }
 
@@ -695,7 +743,9 @@ fn handle_scsi_data_out<D: ScsiBlockDevice>(
     }
 
     pending.buffer[start_offset..end_offset].copy_from_slice(&data_out.data);
-    pending.bytes_received += data_out.data.len() as u32;
+    if end_offset as u32 > pending.bytes_received {
+        pending.bytes_received = end_offset as u32;
+    }
 
     log::debug!("Data-Out: ITT=0x{:08x} off={} len={} F={} recv={}/{} TTT=0x{:08x}",
         data_out.itt, start_offset, data_out.data.len(), data_out.final_flag,
