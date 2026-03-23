@@ -101,6 +101,17 @@ pub enum DigestType {
     CRC32C,
 }
 
+/// Negotiate digest from initiator's offer (e.g. "CRC32C", "None", "CRC32C,None").
+/// Prefer CRC32C when offered; fall back to None.
+pub(crate) fn negotiate_digest(offer: &str) -> DigestType {
+    for token in offer.split(',') {
+        if token.trim().eq_ignore_ascii_case("CRC32C") {
+            return DigestType::CRC32C;
+        }
+    }
+    DigestType::None
+}
+
 
 impl Default for SessionParams {
     fn default() -> Self {
@@ -576,10 +587,10 @@ impl IscsiSession {
                 self.params.initial_r2t = self.params.initial_r2t || (value == "Yes");
             }
             "HeaderDigest" => {
-                self.params.header_digest = DigestType::None;
+                self.params.header_digest = negotiate_digest(value);
             }
             "DataDigest" => {
-                self.params.data_digest = DigestType::None;
+                self.params.data_digest = negotiate_digest(value);
             }
             // Authentication parameters - handled separately in handle_chap_auth()
             "AuthMethod" | "CHAP_A" | "CHAP_I" | "CHAP_C" | "CHAP_N" | "CHAP_R" => {
@@ -903,10 +914,18 @@ impl IscsiSession {
                                         self.params.max_recv_data_segment_length.to_string()));
                         }
                         "HeaderDigest" => {
-                            params.push(("HeaderDigest".to_string(), "None".to_string()));
+                            params.push(("HeaderDigest".to_string(),
+                                match self.params.header_digest {
+                                    DigestType::CRC32C => "CRC32C",
+                                    DigestType::None => "None",
+                                }.to_string()));
                         }
                         "DataDigest" => {
-                            params.push(("DataDigest".to_string(), "None".to_string()));
+                            params.push(("DataDigest".to_string(),
+                                match self.params.data_digest {
+                                    DigestType::CRC32C => "CRC32C",
+                                    DigestType::None => "None",
+                                }.to_string()));
                         }
                         _ => {}
                     }
@@ -1361,7 +1380,13 @@ mod tests {
         session.apply_initiator_param("HeaderDigest", "CRC32C");
         assert_eq!(session.params.header_digest, DigestType::CRC32C);
 
+        // Reset and test list — CRC32C preferred when offered
+        session.params.header_digest = DigestType::None;
         session.apply_initiator_param("HeaderDigest", "None,CRC32C");
+        assert_eq!(session.params.header_digest, DigestType::CRC32C);
+
+        session.params.header_digest = DigestType::None;
+        session.apply_initiator_param("HeaderDigest", "CRC32C,None");
         assert_eq!(session.params.header_digest, DigestType::CRC32C);
     }
 }

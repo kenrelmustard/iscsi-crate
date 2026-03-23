@@ -301,11 +301,10 @@ impl SessionData {
                 self.params.initial_r2t = self.params.initial_r2t || (value == "Yes");
             }
             "HeaderDigest" => {
-                // Force None until CRC32C implementation is fully tested
-                self.params.header_digest = DigestType::None;
+                self.params.header_digest = crate::session::negotiate_digest(value);
             }
             "DataDigest" => {
-                self.params.data_digest = DigestType::None;
+                self.params.data_digest = crate::session::negotiate_digest(value);
             }
             // Auth parameters handled separately
             "AuthMethod" | "CHAP_A" | "CHAP_I" | "CHAP_C" | "CHAP_N" | "CHAP_R" => {}

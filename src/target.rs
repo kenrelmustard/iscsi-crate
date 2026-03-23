@@ -239,9 +239,9 @@ fn handle_connection<D: ScsiBlockDevice>(
     // Reader thread: reads PDUs, handles NOP-Out inline, forwards rest
     let reader_handle = std::thread::spawn(move || {
         while reader_running.load(Ordering::SeqCst) {
-            let hd = reader_hd.load(Ordering::SeqCst);
-            let dd = reader_dd.load(Ordering::SeqCst);
-            let pdu = match read_pdu_digest(&mut stream, hd, dd) {
+            // Pass atomic refs so flags are loaded AFTER the blocking BHS read,
+            // not before — avoids stale state on the first post-login PDU.
+            let pdu = match read_pdu_atomic(&mut stream, &reader_hd, &reader_dd) {
                 Ok(pdu) => pdu,
                 Err(IscsiError::Io(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                     log::debug!("Connection closed by initiator");
@@ -311,9 +311,18 @@ fn handle_connection<D: ScsiBlockDevice>(
             break;
         };
 
-        // Detect transition to FullFeaturePhase
-        if !was_full_feature && session.is_full_feature() {
-            // Enable negotiated digests
+        // Detect transition to FullFeaturePhase (but don't enable digests yet —
+        // the login response itself must be sent without digests)
+        let entering_full_feature = !was_full_feature && session.is_full_feature();
+
+        // Send responses (login response goes out without digests)
+        for resp_pdu in responses {
+            log::debug!("Sending PDU: {} (opcode 0x{:02x})", resp_pdu.opcode_name(), resp_pdu.opcode);
+            write_pdu_digest(&mut write_stream, &resp_pdu, use_header_digest.load(Ordering::SeqCst), use_data_digest.load(Ordering::SeqCst))?;
+        }
+
+        // NOW enable digests — subsequent PDUs will use them
+        if entering_full_feature {
             if let Some(data) = session.data() {
                 let hd = matches!(data.params.header_digest, crate::session::DigestType::CRC32C);
                 let dd = matches!(data.params.data_digest, crate::session::DigestType::CRC32C);
@@ -328,12 +337,6 @@ fn handle_connection<D: ScsiBlockDevice>(
             session_entered = true;
             let count = active_sessions.fetch_add(1, Ordering::SeqCst);
             log::debug!("Session count: {} -> {}", count, count + 1);
-        }
-
-        // Send responses
-        for resp_pdu in responses {
-            log::debug!("Sending PDU: {} (opcode 0x{:02x})", resp_pdu.opcode_name(), resp_pdu.opcode);
-            write_pdu_digest(&mut write_stream, &resp_pdu, use_header_digest.load(Ordering::SeqCst), use_data_digest.load(Ordering::SeqCst))?;
         }
 
         // Check if session ended
@@ -370,10 +373,29 @@ fn read_pdu(stream: &mut TcpStream) -> ScsiResult<IscsiPdu> {
     read_pdu_digest(stream, false, false)
 }
 
+/// Read a PDU, loading digest flags from atomics AFTER the blocking BHS read.
+/// This ensures the reader thread picks up flag changes made by the main thread
+/// while the reader was blocked waiting for data (e.g. first PDU after login).
+fn read_pdu_atomic(
+    stream: &mut TcpStream,
+    header_digest: &AtomicBool,
+    data_digest: &AtomicBool,
+) -> ScsiResult<IscsiPdu> {
+    let mut bhs = [0u8; BHS_SIZE];
+    stream.read_exact(&mut bhs).map_err(IscsiError::Io)?;
+    // Load flags AFTER the blocking read
+    let hd = header_digest.load(Ordering::SeqCst);
+    let dd = data_digest.load(Ordering::SeqCst);
+    read_pdu_after_bhs(stream, bhs, hd, dd)
+}
+
 fn read_pdu_digest(stream: &mut TcpStream, header_digest: bool, data_digest: bool) -> ScsiResult<IscsiPdu> {
     let mut bhs = [0u8; BHS_SIZE];
     stream.read_exact(&mut bhs).map_err(IscsiError::Io)?;
+    read_pdu_after_bhs(stream, bhs, header_digest, data_digest)
+}
 
+fn read_pdu_after_bhs(stream: &mut TcpStream, bhs: [u8; BHS_SIZE], header_digest: bool, data_digest: bool) -> ScsiResult<IscsiPdu> {
     let ahs_length = bhs[4] as usize * 4;
     let data_length = ((bhs[5] as u32) << 16) | ((bhs[6] as u32) << 8) | (bhs[7] as u32);
     let padded_data_len = (data_length as usize).div_ceil(4) * 4;
@@ -878,8 +900,9 @@ fn handle_scsi_data_out<D: ScsiBlockDevice>(
         pending.r2t_pending = false;
     }
 
-    // Need more data and no R2T outstanding — send one
-    if !pending.r2t_pending && pending.bytes_received < total_expected {
+    // Need more data and no R2T outstanding — send one.
+    // Only after F=1 (current burst complete); don't interrupt unsolicited bursts.
+    if data_out.final_flag && !pending.r2t_pending && pending.bytes_received < total_expected {
         let max_burst = data.params.max_burst_length;
         let remaining = total_expected - pending.bytes_received;
         let request_len = remaining.min(max_burst);
