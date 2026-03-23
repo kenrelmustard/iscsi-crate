@@ -289,18 +289,11 @@ impl SessionData {
                 self.params.initial_r2t = self.params.initial_r2t || (value == "Yes");
             }
             "HeaderDigest" => {
-                self.params.header_digest = if value.contains("CRC32C") {
-                    DigestType::CRC32C
-                } else {
-                    DigestType::None
-                };
+                // Force None until CRC32C implementation is fully tested
+                self.params.header_digest = DigestType::None;
             }
             "DataDigest" => {
-                self.params.data_digest = if value.contains("CRC32C") {
-                    DigestType::CRC32C
-                } else {
-                    DigestType::None
-                };
+                self.params.data_digest = DigestType::None;
             }
             // Auth parameters handled separately
             "AuthMethod" | "CHAP_A" | "CHAP_I" | "CHAP_C" | "CHAP_N" | "CHAP_R" => {}

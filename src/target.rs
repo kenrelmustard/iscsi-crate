@@ -223,6 +223,14 @@ fn handle_connection<D: ScsiBlockDevice>(
         stream.try_clone().map_err(IscsiError::Io)?
     ));
 
+    // Shared digest flags — set after login negotiation
+    let use_header_digest = Arc::new(AtomicBool::new(false));
+    let use_data_digest = Arc::new(AtomicBool::new(false));
+    let reader_hd = use_header_digest.clone();
+    let reader_dd = use_data_digest.clone();
+    let nop_hd = use_header_digest.clone();
+    let nop_dd = use_data_digest.clone();
+
     // Channel for PDUs from reader thread to main processing loop
     let (pdu_tx, pdu_rx) = std::sync::mpsc::channel::<IscsiPdu>();
     let reader_running = running.clone();
@@ -231,7 +239,9 @@ fn handle_connection<D: ScsiBlockDevice>(
     // Reader thread: reads PDUs, handles NOP-Out inline, forwards rest
     let reader_handle = std::thread::spawn(move || {
         while reader_running.load(Ordering::SeqCst) {
-            let pdu = match read_pdu(&mut stream) {
+            let hd = reader_hd.load(Ordering::SeqCst);
+            let dd = reader_dd.load(Ordering::SeqCst);
+            let pdu = match read_pdu_digest(&mut stream, hd, dd) {
                 Ok(pdu) => pdu,
                 Err(IscsiError::Io(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                     log::debug!("Connection closed by initiator");
@@ -260,7 +270,7 @@ fn handle_connection<D: ScsiBlockDevice>(
                 resp.specific[0..4].copy_from_slice(&pdu.specific[0..4]); // TTT
                 // StatSN, ExpCmdSN, MaxCmdSN will be approximate but good enough for keepalive
                 if let Ok(mut writer) = nop_writer.lock() {
-                    let _ = write_pdu(&mut *writer, &resp);
+                    let _ = write_pdu_digest(&mut *writer, &resp, nop_hd.load(Ordering::SeqCst), nop_dd.load(Ordering::SeqCst));
                 }
                 continue;
             }
@@ -303,7 +313,17 @@ fn handle_connection<D: ScsiBlockDevice>(
 
         // Detect transition to FullFeaturePhase
         if !was_full_feature && session.is_full_feature() {
-            log::info!("Session entered FullFeaturePhase, increasing timeout");
+            // Enable negotiated digests
+            if let Some(data) = session.data() {
+                let hd = matches!(data.params.header_digest, crate::session::DigestType::CRC32C);
+                let dd = matches!(data.params.data_digest, crate::session::DigestType::CRC32C);
+                use_header_digest.store(hd, Ordering::SeqCst);
+                use_data_digest.store(dd, Ordering::SeqCst);
+                log::info!("Session entered FullFeaturePhase, HeaderDigest={}, DataDigest={}",
+                    if hd { "CRC32C" } else { "None" }, if dd { "CRC32C" } else { "None" });
+            } else {
+                log::info!("Session entered FullFeaturePhase");
+            }
 
             session_entered = true;
             let count = active_sessions.fetch_add(1, Ordering::SeqCst);
@@ -313,7 +333,7 @@ fn handle_connection<D: ScsiBlockDevice>(
         // Send responses
         for resp_pdu in responses {
             log::debug!("Sending PDU: {} (opcode 0x{:02x})", resp_pdu.opcode_name(), resp_pdu.opcode);
-            write_pdu(&mut write_stream, &resp_pdu)?;
+            write_pdu_digest(&mut write_stream, &resp_pdu, use_header_digest.load(Ordering::SeqCst), use_data_digest.load(Ordering::SeqCst))?;
         }
 
         // Check if session ended
@@ -330,10 +350,26 @@ fn handle_connection<D: ScsiBlockDevice>(
     Ok(session_entered)
 }
 
-/// Read a PDU from the TCP stream
+/// Read a PDU from the TCP stream with optional digest verification
 fn read_pdu(stream: &mut TcpStream) -> ScsiResult<IscsiPdu> {
+    read_pdu_digest(stream, false, false)
+}
+
+fn read_pdu_digest(stream: &mut TcpStream, header_digest: bool, data_digest: bool) -> ScsiResult<IscsiPdu> {
     let mut bhs = [0u8; BHS_SIZE];
     stream.read_exact(&mut bhs).map_err(IscsiError::Io)?;
+
+    // Read and verify header digest if enabled
+    if header_digest {
+        let mut hd = [0u8; 4];
+        stream.read_exact(&mut hd).map_err(IscsiError::Io)?;
+        let expected = u32::from_le_bytes(hd);
+        let actual = crc32c::crc32c(&bhs);
+        if expected != actual {
+            log::error!("Header digest mismatch: expected 0x{:08x}, got 0x{:08x}", expected, actual);
+            return Err(IscsiError::Protocol("Header digest mismatch".to_string()));
+        }
+    }
 
     let ahs_length = bhs[4] as usize * 4;
     let data_length = ((bhs[5] as u32) << 16) | ((bhs[6] as u32) << 8) | (bhs[7] as u32);
@@ -347,6 +383,18 @@ fn read_pdu(stream: &mut TcpStream) -> ScsiResult<IscsiPdu> {
         stream.read_exact(&mut full_pdu[BHS_SIZE..]).map_err(IscsiError::Io)?;
     }
 
+    // Read and verify data digest if enabled and there's data
+    if data_digest && padded_data_len > 0 {
+        let mut dd = [0u8; 4];
+        stream.read_exact(&mut dd).map_err(IscsiError::Io)?;
+        let expected = u32::from_le_bytes(dd);
+        let actual = crc32c::crc32c(&full_pdu[BHS_SIZE + ahs_length..]);
+        if expected != actual {
+            log::error!("Data digest mismatch: expected 0x{:08x}, got 0x{:08x}", expected, actual);
+            return Err(IscsiError::Protocol("Data digest mismatch".to_string()));
+        }
+    }
+
     let pdu = IscsiPdu::from_bytes(&full_pdu)?;
 
     if full_pdu.len() >= 48 {
@@ -356,15 +404,38 @@ fn read_pdu(stream: &mut TcpStream) -> ScsiResult<IscsiPdu> {
     Ok(pdu)
 }
 
-/// Write a PDU to the TCP stream
+/// Write a PDU to the TCP stream with optional digests
 fn write_pdu(stream: &mut TcpStream, pdu: &IscsiPdu) -> ScsiResult<()> {
+    write_pdu_digest(stream, pdu, false, false)
+}
+
+fn write_pdu_digest(stream: &mut TcpStream, pdu: &IscsiPdu, header_digest: bool, data_digest: bool) -> ScsiResult<()> {
     let bytes = pdu.to_bytes();
 
     if bytes.len() >= 48 {
         log::debug!("Sending PDU header hex: {}", bytes[0..48].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" "));
     }
 
-    stream.write_all(&bytes).map_err(IscsiError::Io)?;
+    // Write BHS
+    stream.write_all(&bytes[..BHS_SIZE]).map_err(IscsiError::Io)?;
+
+    // Write header digest if enabled
+    if header_digest {
+        let crc = crc32c::crc32c(&bytes[..BHS_SIZE]);
+        stream.write_all(&crc.to_le_bytes()).map_err(IscsiError::Io)?;
+    }
+
+    // Write rest (AHS + data)
+    if bytes.len() > BHS_SIZE {
+        stream.write_all(&bytes[BHS_SIZE..]).map_err(IscsiError::Io)?;
+    }
+
+    // Write data digest if enabled and there's data
+    if data_digest && bytes.len() > BHS_SIZE {
+        let crc = crc32c::crc32c(&bytes[BHS_SIZE..]);
+        stream.write_all(&crc.to_le_bytes()).map_err(IscsiError::Io)?;
+    }
+
     stream.flush().map_err(IscsiError::Io)?;
     Ok(())
 }
@@ -612,6 +683,7 @@ fn handle_write_command<D: ScsiBlockDevice>(
             next_r2t_offset: bytes_received,
             expected_data_len: expected_data_len as u32,
             completed: false,
+            r2t_pending: false,
         });
 
         // If F bit is clear, the initiator will send more unsolicited Data-Out
@@ -778,37 +850,17 @@ fn handle_scsi_data_out<D: ScsiBlockDevice>(
         )]);
     }
 
-    // F bit set but not enough data — need R2T for remainder
-    if data_out.final_flag && pending.bytes_received < total_expected {
+    // F bit set — this burst is done. Mark R2T as no longer pending.
+    if data_out.final_flag {
+        pending.r2t_pending = false;
+    }
+
+    // Need more data and no R2T outstanding — send one
+    if !pending.r2t_pending && pending.bytes_received < total_expected {
         let max_burst = data.params.max_burst_length;
         let remaining = total_expected - pending.bytes_received;
         let request_len = remaining.min(max_burst);
         let current_offset = pending.bytes_received;
-        let r2t_sn = pending.r2t_sn;
-        let ttt = pending.ttt;
-        let lun = pending.lun;
-        let itt = data_out.itt;
-
-        pending.next_r2t_offset = current_offset + request_len;
-        pending.r2t_sn += 1;
-
-        let r2t = IscsiPdu::r2t(
-            lun, itt, ttt, data.stat_sn,
-            data.exp_cmd_sn, data.max_cmd_sn,
-            r2t_sn, current_offset, request_len,
-        );
-
-        return Ok(vec![r2t]);
-    }
-
-    // Transfer not complete yet - check if we need to send next R2T
-    // (respecting MaxOutstandingR2T=1 by only sending R2T after ALL data from previous R2T received)
-    // Only send next R2T if we've received data up to where the next R2T should start
-    if pending.bytes_received >= pending.next_r2t_offset && pending.next_r2t_offset < pending.expected_data_len {
-        let max_burst = data.params.max_burst_length;
-        let remaining = pending.expected_data_len - pending.next_r2t_offset;
-        let request_len = remaining.min(max_burst);
-        let current_offset = pending.next_r2t_offset;
         let r2t_sn = pending.r2t_sn;
         let ttt = pending.ttt;
         let lun = pending.lun;
@@ -819,6 +871,8 @@ fn handle_scsi_data_out<D: ScsiBlockDevice>(
         pending.r2t_sn += 1;
 
         // Send next R2T
+        pending.r2t_pending = true;
+
         let r2t = IscsiPdu::r2t(
             lun, itt, ttt, data.stat_sn,
             data.exp_cmd_sn, data.max_cmd_sn,
@@ -828,7 +882,7 @@ fn handle_scsi_data_out<D: ScsiBlockDevice>(
         return Ok(vec![r2t]);
     }
 
-    // All R2Ts sent, waiting for more DATA-OUT PDUs
+    // Waiting for more DATA-OUT PDUs
     Ok(vec![])
 }
 
@@ -1702,6 +1756,7 @@ fn handle_write_command_boxed(
             next_r2t_offset: bytes_received,
             expected_data_len: expected_data_len as u32,
             completed: false,
+            r2t_pending: false,
         });
 
         // If F bit is clear, the initiator will send more unsolicited Data-Out

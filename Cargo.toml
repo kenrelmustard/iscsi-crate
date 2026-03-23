@@ -17,6 +17,7 @@ log = "0.4"
 md5 = "0.7"
 rand = "0.8"
 hex = "0.4"
+crc32c = "0.6"
 
 [dev-dependencies]
 env_logger = "0.11"
