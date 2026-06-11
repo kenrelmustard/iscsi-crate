@@ -102,11 +102,16 @@ pub enum DigestType {
 }
 
 /// Negotiate digest from initiator's offer (e.g. "CRC32C", "None", "CRC32C,None").
-/// Prefer CRC32C when offered; fall back to None.
+/// RFC 3720 5.2.2: select the first offered value we support, honouring the
+/// initiator's preference order; fall back to None.
 pub(crate) fn negotiate_digest(offer: &str) -> DigestType {
     for token in offer.split(',') {
-        if token.trim().eq_ignore_ascii_case("CRC32C") {
+        let token = token.trim();
+        if token.eq_ignore_ascii_case("CRC32C") {
             return DigestType::CRC32C;
+        }
+        if token.eq_ignore_ascii_case("None") {
+            return DigestType::None;
         }
     }
     DigestType::None
@@ -1380,10 +1385,11 @@ mod tests {
         session.apply_initiator_param("HeaderDigest", "CRC32C");
         assert_eq!(session.params.header_digest, DigestType::CRC32C);
 
-        // Reset and test list — CRC32C preferred when offered
-        session.params.header_digest = DigestType::None;
+        // Lists: first supported value wins, in the initiator's preference
+        // order (RFC 3720 5.2.2)
+        session.params.header_digest = DigestType::CRC32C;
         session.apply_initiator_param("HeaderDigest", "None,CRC32C");
-        assert_eq!(session.params.header_digest, DigestType::CRC32C);
+        assert_eq!(session.params.header_digest, DigestType::None);
 
         session.params.header_digest = DigestType::None;
         session.apply_initiator_param("HeaderDigest", "CRC32C,None");

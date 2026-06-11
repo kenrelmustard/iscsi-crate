@@ -62,8 +62,12 @@ NEGOTIATE key=DataSequenceInOrder target=No init=Yes rfc=Yes impl=Yes section=12
 NEGOTIATE key=DataSequenceInOrder target=No init=No rfc=No impl=No section=12.19 status=conform
 NEGOTIATE key=HeaderDigest target=CRC32C init=CRC32C rfc=CRC32C impl=CRC32C section=12.1 status=conform
 NEGOTIATE key=HeaderDigest target=CRC32C init=None rfc=None impl=None section=12.1 status=conform
+NEGOTIATE key=HeaderDigest target=CRC32C init=CRC32C,None rfc=CRC32C impl=CRC32C section=12.1 status=conform
+NEGOTIATE key=HeaderDigest target=CRC32C init=None,CRC32C rfc=None impl=None section=12.1 status=conform
 NEGOTIATE key=DataDigest target=CRC32C init=CRC32C rfc=CRC32C impl=CRC32C section=12.1 status=conform
 NEGOTIATE key=DataDigest target=CRC32C init=None rfc=None impl=None section=12.1 status=conform
+NEGOTIATE key=DataDigest target=CRC32C init=CRC32C,None rfc=CRC32C impl=CRC32C section=12.1 status=conform
+NEGOTIATE key=DataDigest target=CRC32C init=None,CRC32C rfc=None impl=None section=12.1 status=conform
 CONSTRAINT name=first_burst_le_max_burst max_burst_offer=1024 first_burst_offer=65536 expect_max=1024 expect_first=1024 rfc=valid status=conform
 DEFAULT key=InitialR2T impl_default=No rfc_default=Yes section=12.10 status=deviation:D4
 DEFAULT key=ImmediateData impl_default=Yes rfc_default=Yes section=12.11 status=conform

@@ -172,8 +172,8 @@ rfc_combine('ImmediateData',            T, O, R) :- band(T, O, R).
 rfc_combine('InitialR2T',               T, O, R) :- bor(T, O, R).
 rfc_combine('DataPDUInOrder',           T, O, R) :- bor(T, O, R).
 rfc_combine('DataSequenceInOrder',      T, O, R) :- bor(T, O, R).
-rfc_combine('HeaderDigest',             _, O, O).          % target supports {None,CRC32C}
-rfc_combine('DataDigest',               _, O, O).
+rfc_combine('HeaderDigest',             _, O, R) :- list_select(O, R).   % 5.2.2
+rfc_combine('DataDigest',               _, O, R) :- list_select(O, R).
 
 % impl_combine(+Key, +Target, +Offer, -Result): what src/typestate_session.rs
 % actually does (apply_initiator_param), modelled faithfully.
@@ -188,13 +188,16 @@ impl_combine('ImmediateData',            T, O, R) :- band(T, O, R).
 impl_combine('InitialR2T',               T, O, R) :- bor(T, O, R).
 impl_combine('DataPDUInOrder',           T, O, R) :- bor(T, O, R).   % fixed: OR
 impl_combine('DataSequenceInOrder',      T, O, R) :- bor(T, O, R).   % fixed: OR
-impl_combine('HeaderDigest',             _, O, R) :- digest_select(O, R).
-impl_combine('DataDigest',               _, O, R) :- digest_select(O, R).
+impl_combine('HeaderDigest',             _, O, R) :- list_select(O, R).
+impl_combine('DataDigest',               _, O, R) :- list_select(O, R).
 
-% src/session.rs negotiate_digest/1: CRC32C whenever the offer contains it,
-% otherwise None.
-digest_select('CRC32C', 'CRC32C') :- !.
-digest_select(_, 'None').
+% RFC 3720 5.2.2 list selection over the corpus offers: the first value the
+% target supports ({None, CRC32C}), in the initiator's preference order.
+% Mirrored by src/session.rs negotiate_digest/1.
+list_select('CRC32C',      'CRC32C').
+list_select('None',        'None').
+list_select('CRC32C,None', 'CRC32C').
+list_select('None,CRC32C', 'None').
 
 imin(A, B, A) :- A =< B, !.
 imin(_, B, B).
@@ -243,11 +246,16 @@ neg_case('DataSequenceInOrder',      yes, yes).
 neg_case('DataSequenceInOrder',      yes, no).
 neg_case('DataSequenceInOrder',      no,  yes).
 neg_case('DataSequenceInOrder',      no,  no).
-% Digests: target advertises CRC32C support; offers CRC32C / None.
+% Digests: target supports {None, CRC32C}; single-value and list offers,
+% the latter exercising preference order (RFC 3720 5.2.2).
 neg_case('HeaderDigest',             'CRC32C', 'CRC32C').
 neg_case('HeaderDigest',             'CRC32C', 'None').
+neg_case('HeaderDigest',             'CRC32C', 'CRC32C,None').
+neg_case('HeaderDigest',             'CRC32C', 'None,CRC32C').
 neg_case('DataDigest',               'CRC32C', 'CRC32C').
 neg_case('DataDigest',               'CRC32C', 'None').
+neg_case('DataDigest',               'CRC32C', 'CRC32C,None').
+neg_case('DataDigest',               'CRC32C', 'None,CRC32C').
 
 emit_negotiate :-
     forall(neg_case(Key, Target, Offer),
