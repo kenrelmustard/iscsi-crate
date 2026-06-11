@@ -35,10 +35,17 @@ open deviations are documented rather than bugs:
 
 - **D1** (RFC §12.1, `src/typestate_session.rs:296`): the CRC32C digest wire
   path exists in `target.rs` but `read_pdu`/`write_pdu` hardcode digests off,
-  so the negotiated value is never plumbed through. Enabling CRC32C in
-  negotiation without plumbing it would corrupt every connection — hence it is
-  a deferred, interop-tested feature, not a quick fix. D1 is also the root
-  cause of the pre-existing failing unit test
+  so the negotiated value is never plumbed through. The wire format itself has
+  been made tgt/open-iscsi-correct: the digest is emitted little-endian
+  (verified against fujita/tgt `usr/iscsi/iscsid.c`, which writes the raw u32
+  in native order — little-endian on the x86 hosts iSCSI runs on, the well-
+  known byte-order divergence), and the header digest now covers BHS **+ AHS**
+  with the correct `BHS | AHS | HeaderDigest | Data | DataDigest` framing
+  (`iscsi_digest`, pinned by `target::tests::iscsi_digest_matches_tgt_wire_format`
+  and `header_digest_covers_bhs_and_ahs`). What remains to close D1 is purely
+  plumbing the negotiated bool into `read_pdu`/`write_pdu` and interop-testing
+  against a real initiator; until then it stays forced to None. D1 is also the
+  root cause of the pre-existing failing unit test
   `session::tests::test_header_digest_negotiation`, which still expects CRC32C.
 - **D4** (RFC §12.10, `src/session.rs:119`): defaulting `InitialR2T=No` enables
   unsolicited/immediate data — a deliberate, widely-interoperable optimisation.
