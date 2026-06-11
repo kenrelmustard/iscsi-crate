@@ -38,3 +38,6 @@ test_tc008_debug
 # Test output files
 *.log
 test_output.*
+
+# Claude Code devlogs
+.devlog/

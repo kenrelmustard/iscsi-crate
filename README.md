@@ -23,7 +23,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-iscsi-target = "0.1.0"
+iscsi-target = "1.0.0"
 ```
 
 Create a simple in-memory target:
@@ -197,7 +197,7 @@ including RFC 3720 §5.2.2 preference-order selection for list offers.
 
 ## Project Status
 
-Current version: 0.1.0
+Current version: 1.0.0
 
 - Core iSCSI protocol: Complete
 - SCSI commands: Complete for basic operations
