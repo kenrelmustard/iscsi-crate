@@ -157,26 +157,182 @@ fn digest_str(d: DigestType) -> String {
     .to_string()
 }
 
+fn parse_digest(s: &str) -> DigestType {
+    match s {
+        "CRC32C" => DigestType::CRC32C,
+        _ => DigestType::None,
+    }
+}
+
+/// Set a key's target-side starting value, so the *result function* is tested
+/// rather than only the behaviour at the default.
+fn set_param(data: &mut SessionData, key: &str, val: &str) {
+    match key {
+        "MaxBurstLength" => data.params.max_burst_length = val.parse().unwrap(),
+        "FirstBurstLength" => data.params.first_burst_length = val.parse().unwrap(),
+        "DefaultTime2Wait" => data.params.default_time2wait = val.parse().unwrap(),
+        "DefaultTime2Retain" => data.params.default_time2retain = val.parse().unwrap(),
+        "MaxOutstandingR2T" => data.params.max_outstanding_r2t = val.parse().unwrap(),
+        "ErrorRecoveryLevel" => data.params.error_recovery_level = val.parse().unwrap(),
+        "MaxRecvDataSegmentLength" => data.params.max_xmit_data_segment_length = val.parse().unwrap(),
+        "ImmediateData" => data.params.immediate_data = val == "Yes",
+        "InitialR2T" => data.params.initial_r2t = val == "Yes",
+        "DataPDUInOrder" => data.params.data_pdu_in_order = val == "Yes",
+        "DataSequenceInOrder" => data.params.data_sequence_in_order = val == "Yes",
+        "HeaderDigest" => data.params.header_digest = parse_digest(val),
+        "DataDigest" => data.params.data_digest = parse_digest(val),
+        other => panic!("unknown negotiation key in corpus: {}", other),
+    }
+}
+
+/// Each NEGOTIATE row carries the RFC-correct result (`rfc`) and what the
+/// implementation actually produces (`impl`). We assert the code matches the
+/// `impl` prediction exactly (regression anchor), and that conform/deviation
+/// rows really do agree/disagree with the RFC.
 #[test]
 fn model_negotiate_matches_implementation() {
     let mut checked = 0;
+    let mut deviations = 0;
     for r in rows_of("NEGOTIATE") {
         let key = field(&r, "key");
+        let target = field(&r, "target");
         let init = field(&r, "init");
-        let expect = field(&r, "expect");
+        let rfc = field(&r, "rfc");
+        let impl_expected = field(&r, "impl");
+        let status = field(&r, "status");
 
         let mut data = SessionData::default();
+        set_param(&mut data, key, target);
         data.apply_initiator_param(key, init);
         let actual = negotiated_value(&data, key);
 
+        // The implementation must behave exactly as the model predicts.
         assert_eq!(
-            actual, expect,
-            "NEGOTIATE {}={}: model said {}, impl produced {}",
-            key, init, expect, actual
+            actual, impl_expected,
+            "NEGOTIATE {} target={} init={}: model predicted impl={}, code produced {}",
+            key, target, init, impl_expected, actual
         );
+
+        if status == "conform" {
+            assert_eq!(
+                impl_expected, rfc,
+                "NEGOTIATE {} target={} init={}: conform row but rfc={} != impl={}",
+                key, target, init, rfc, impl_expected
+            );
+        } else {
+            // A deviation row: the implementation must genuinely differ from
+            // the RFC. If it no longer does, the deviation was fixed and the
+            // registry needs updating.
+            assert_ne!(
+                impl_expected, rfc,
+                "NEGOTIATE {} target={} init={}: tagged {} but impl now matches RFC ({}) -- update deviation registry",
+                key, target, init, status, rfc
+            );
+            deviations += 1;
+        }
         checked += 1;
     }
     assert!(checked > 0, "no NEGOTIATE rows exercised");
+    assert!(deviations > 0, "expected NEGOTIATE deviation rows (D1/D3) to be exercised");
+}
+
+// ---------------------------------------------------------------------------
+// Layer 2b: cross-key constraint FirstBurstLength <= MaxBurstLength (RFC 12.14)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn model_constraint_first_burst_le_max_burst() {
+    let mut checked = 0;
+    for r in rows_of("CONSTRAINT") {
+        let mbo = field(&r, "max_burst_offer");
+        let fbo = field(&r, "first_burst_offer");
+        let expect_max: u32 = field(&r, "expect_max").parse().unwrap();
+        let expect_first: u32 = field(&r, "expect_first").parse().unwrap();
+        let status = field(&r, "status");
+
+        let mut data = SessionData::default();
+        data.apply_initiator_param("MaxBurstLength", mbo);
+        data.apply_initiator_param("FirstBurstLength", fbo);
+
+        assert_eq!(data.params.max_burst_length, expect_max);
+        assert_eq!(data.params.first_burst_length, expect_first);
+
+        if status.starts_with("deviation") {
+            // RFC 12.14 requires FirstBurstLength <= MaxBurstLength; the model
+            // asserts the implementation lets this be violated.
+            assert!(
+                data.params.first_burst_length > data.params.max_burst_length,
+                "expected the unenforced constraint to be reachable (first {} should exceed max {})",
+                data.params.first_burst_length, data.params.max_burst_length
+            );
+        } else {
+            assert!(data.params.first_burst_length <= data.params.max_burst_length);
+        }
+        checked += 1;
+    }
+    assert!(checked > 0, "no CONSTRAINT rows exercised");
+}
+
+// ---------------------------------------------------------------------------
+// Layer 2c: default-value conformance (RFC Section 12)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn model_default_values_match() {
+    let data = SessionData::default();
+    let mut checked = 0;
+    for r in rows_of("DEFAULT") {
+        let key = field(&r, "key");
+        let impl_default = field(&r, "impl_default");
+        let rfc_default = field(&r, "rfc_default");
+        let status = field(&r, "status");
+
+        let actual = negotiated_value(&data, key);
+        assert_eq!(
+            actual, impl_default,
+            "DEFAULT {}: model said impl default {}, code default is {}",
+            key, impl_default, actual
+        );
+
+        if status == "conform" {
+            assert_eq!(impl_default, rfc_default, "DEFAULT {} conform mismatch", key);
+        } else {
+            assert_ne!(
+                impl_default, rfc_default,
+                "DEFAULT {}: tagged {} but impl default now equals RFC default ({})",
+                key, status, rfc_default
+            );
+        }
+        checked += 1;
+    }
+    assert!(checked > 0, "no DEFAULT rows exercised");
+}
+
+// ---------------------------------------------------------------------------
+// Deviation registry: the set of deviation IDs in the corpus must match the
+// audited registry, so fixing or introducing a deviation forces an update.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn model_deviation_registry_is_exhaustive() {
+    use std::collections::BTreeSet;
+
+    let expected: BTreeSet<&str> = ["D1", "D2", "D3", "D4"].into_iter().collect();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for r in load_corpus() {
+        if let Some(status) = r.fields.get("status") {
+            if let Some(id) = status.strip_prefix("deviation:") {
+                seen.insert(id.to_string());
+            }
+        }
+    }
+    let seen_refs: BTreeSet<&str> = seen.iter().map(|s| s.as_str()).collect();
+    assert_eq!(
+        seen_refs, expected,
+        "deviation IDs in corpus {:?} differ from audited registry {:?}; \
+         update deviation/5 in model/iscsi_protocol.pl and the table in model/README.md",
+        seen_refs, expected
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -1,14 +1,40 @@
 # Scryer Prolog model of the iSCSI protocol
 
 This directory contains a small **executable model** of the parts of iSCSI
-(RFC 3720) whose behaviour is *logical* rather than wire-format. The model is
-the source of truth for a generated test corpus that is replayed against the
-real Rust implementation by `tests/model_corpus_tests.rs`.
+whose behaviour is *logical* rather than wire-format. The rules are derived
+from **RFC 3720** (and RFC 1994 for CHAP, RFC 1982 for serial-number
+arithmetic) — **not** from the Rust implementation. The model is the source of
+truth for a generated test corpus that is replayed against the real code by
+`tests/model_corpus_tests.rs`.
 
-The point: write the protocol rules **once, declaratively**, let Prolog
-enumerate cases exhaustively, and use the result as an independent oracle for
-the implementation. When the model and the code disagree, a test fails — which
-is exactly the signal you want.
+The point: write the protocol rules **once, declaratively, from the spec**,
+let Prolog enumerate cases exhaustively, and use the result as an *independent*
+oracle. A model that merely restates the code is a tautology — so each
+negotiation rule cites its RFC section, and every place the implementation
+diverges from the RFC is recorded in an explicit `deviation/5` registry rather
+than silently baked in. When the code and the RFC disagree, the corpus says so
+out loud.
+
+## Audited deviations from RFC 3720
+
+These are the points where the current implementation diverges from the spec.
+The corpus tags affected rows `status=deviation:Dn`, and the tests assert each
+divergence is genuinely present; the registry is kept exhaustive by
+`model_deviation_registry_is_exhaustive`.
+
+| ID | Subject | RFC says | Implementation does | Reference |
+|----|---------|----------|---------------------|-----------|
+| **D1** | HeaderDigest / DataDigest | negotiable list `{None, CRC32C}` | forced to `None` unconditionally | RFC 3720 §12.1; `src/typestate_session.rs:291` |
+| **D2** | FirstBurstLength | MUST NOT exceed MaxBurstLength | cross-key constraint not enforced | RFC 3720 §12.14; `src/typestate_session.rs:254` |
+| **D3** | DataPDUInOrder / DataSequenceInOrder | boolean result function **OR** against the target value | takes the initiator's value directly | RFC 3720 §12.18–12.19; `src/typestate_session.rs:274` |
+| **D4** | InitialR2T default | default is **Yes** | default is **No** | RFC 3720 §12.10; `src/session.rs:119` |
+
+D1 is documented in the code (CRC32C disabled until tested) and is the root
+cause of the pre-existing failing unit test `session::tests::test_header_digest_negotiation`,
+which still expects CRC32C. D2 is a genuine conformance gap. D3 is masked at
+the default (Yes) but wrong whenever a target starts from a different value.
+D4 is a deliberate optimisation (allow unsolicited data) but still a deviation
+from the RFC default. None are fixed by this change — they are *surfaced*.
 
 ## Files
 
@@ -21,21 +47,27 @@ is exactly the signal you want.
 
 ## What is modelled
 
-1. **Login state machine** (`next_state/4`) — RFC 3720 §5.3. A single
-   `process_login` step from `Free` as a function of CSG / NSG / Transit,
-   cross-checked against `AnySession::process_login`. All 32 `(CSG,NSG,Transit)`
+1. **Key negotiation result-functions** (`rfc_combine/4` vs `impl_combine/4`) —
+   RFC 3720 §12. For each key the model computes both the RFC-correct result of
+   combining the target's value with the initiator's offer *and* what the code
+   actually does, then marks the row conform or deviation. The test sets the
+   target value explicitly so the *result function* is exercised, not just the
+   behaviour at the default. Minimum/Maximum for numerics, AND/OR for booleans,
+   list-selection for digests — each citing its section (12.1, 12.10–12.20).
+2. **Cross-key constraint** (`constraint_case/5`) — RFC 3720 §12.14,
+   FirstBurstLength ≤ MaxBurstLength (deviation D2).
+3. **Default-value conformance** (`default_case/4`) — RFC 3720 §12, the
+   assumed-if-absent default of each key (deviation D4 on InitialR2T).
+4. **Login state machine** (`next_state/4`) — RFC 3720 §5.3. A single login step
+   from `Free` as a function of CSG / NSG / Transit per the RFC stage codes,
+   checked against `AnySession::process_login`. All 32 `(CSG,NSG,Transit)`
    combinations are enumerated, including the illegal CSG values that must land
-   in `Failed` — this directly guards the auth-bypass surface.
-2. **Key negotiation result-functions** (`neg_rule/3`, `neg_result/4`) —
-   RFC 3720 §5.2/§12. Minimum/Maximum for numerics, AND/OR for booleans,
-   digests forced to `None`, checked against `SessionData::apply_initiator_param`.
-3. **Command-sequence-number window** (`sn_in_window/3`) — RFC 3720 §3.2.2.1.
-   32-bit serial-number arithmetic including wrap-around, checked against
-   `SessionData::validate_cmd_sn`.
-4. **CHAP message ordering** (`chap_case/4`) — RFC 3720 §11. The legal ordering
-   of `AuthMethod`/`CHAP_A`/`CHAP_I`/`CHAP_C`/`CHAP_N`/`CHAP_R` and the coarse
-   outcome of the first initiator message set, checked against the security
-   negotiation path.
+   in `Failed` — this guards the auth-bypass surface.
+5. **Command-sequence-number window** (`sn_in_window/3`) — RFC 3720 §3.2.2.1 /
+   RFC 1982. 32-bit serial-number arithmetic including wrap-around.
+6. **CHAP message ordering** (`chap_case/4`) — RFC 3720 §11 / RFC 1994. The
+   legal ordering of `AuthMethod`/`CHAP_A`/`CHAP_I`/`CHAP_C`/`CHAP_N`/`CHAP_R`
+   and the coarse outcome of the first initiator message set.
 
 ## What is **not** modelled
 
@@ -69,18 +101,30 @@ corpus`, and (if a new record `KIND` was introduced) add a matching arm in
 `tests/model_corpus_tests.rs`. The corpus format is one record per line:
 
 ```
-SEQWINDOW exp=<u32> max=<u32> sn=<u32> expect=<accept|reject>
-NEGOTIATE key=<Key> init=<value> expect=<value>
-STATE     csg=<0-3> nsg=<0-3> transit=<0|1> expect=<StateName>
-CHAP      case=<name> params=<K:V,...|-> expect_state=<State> expect_key=<k=v|key|none>
+SEQWINDOW  exp=<u32> max=<u32> sn=<u32> expect=<accept|reject>
+NEGOTIATE  key=<Key> target=<value> init=<value> rfc=<value> impl=<value> section=<12.x> status=<conform|deviation:Dn>
+CONSTRAINT name=<name> max_burst_offer=<u32> first_burst_offer=<u32> expect_max=<u32> expect_first=<u32> rfc=<valid|invalid> status=<conform|deviation:Dn>
+DEFAULT    key=<Key> impl_default=<value> rfc_default=<value> section=<12.x> status=<conform|deviation:Dn>
+STATE      csg=<0-3> nsg=<0-3> transit=<0|1> expect=<StateName>
+CHAP       case=<name> params=<K:V,...|-> expect_state=<State> expect_key=<k=v|key|none>
 ```
+
+Rows carrying `status=deviation:Dn` reference the deviation table above; the
+`rfc` and `impl` columns differ on exactly those rows.
 
 ## Is this worth it?
 
-For this crate, the model earns its keep on the **login state machine and
-negotiation rules** — exhaustive `(CSG,NSG,Transit)` enumeration and the
-min/max/AND/OR matrix are tedious and error-prone to maintain by hand, and the
-illegal-transition cases are security-relevant. The sequence-number and CHAP
-layers are a smaller win but cheap to include. It is deliberately *not* a full
-formal model (no TLA+-style temporal properties, no multi-step session traces
-yet) — it is a lightweight, regenerable oracle that lives next to the code.
+Because the rules are derived from the RFC rather than the code, the model is
+an **independent auditor**, not a mirror. That is what let it surface D1–D4 —
+including D2 (a real conformance gap) and D3 (a result-function bug masked at
+the default) — which example-based tests written alongside the implementation
+would not catch, since they tend to encode the same reading of the spec the
+code already has.
+
+It earns its keep most on the **negotiation rules and login state machine** —
+the min/max/AND/OR matrix and the 32 `(CSG,NSG,Transit)` transitions are
+tedious and error-prone to maintain by hand, and the illegal-transition cases
+are security-relevant. It is deliberately *not* a full formal model (no
+TLA+-style temporal properties, no multi-step session traces yet) — it is a
+lightweight, regenerable oracle that lives next to the code and keeps an honest
+ledger of where the code and the spec part ways.
