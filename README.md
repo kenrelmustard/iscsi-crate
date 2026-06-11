@@ -13,7 +13,8 @@ A pure Rust iSCSI target implementation for building custom storage solutions.
 - **CHAP Authentication**: One-way and mutual CHAP support for secure connections
 - **Discovery Sessions**: SendTargets protocol for target discovery
 - **Write Operations**: Immediate data and multi-PDU Data-Out support
-- **Real-World Tested**: Verified with Linux open-iscsi and iscsiadm
+- **Real-World Tested**: Verified with Linux open-iscsi and iscsiadm, including CRC32C header/data digest interop
+- **RFC-Conformance Tested**: Corpus-driven tests generated from an independent Prolog model of RFC 3720, with an explicit registry of every known deviation from the spec
 - **Builder Pattern API**: Easy configuration and setup
 
 ## Quick Start
@@ -144,10 +145,7 @@ let target = IscsiTarget::builder()
 - [API Documentation](docs/README.md)
 - [Implementation Guide](docs/IMPLEMENTATION.md)
 - [CHAP Authentication](docs/CHAP_IMPLEMENTATION.md)
-- [RFC 3720 Implementation](docs/RFC3720_IMPLEMENTATION_SUMMARY.md)
-- [Project Status](docs/PROJECT_STATUS.md)
-- [Roadmap](docs/ROADMAP.md)
-- [Testing Guide](docs/testing.md)
+- [RFC 3720 Conformance Model](model/README.md)
 
 ## Testing
 
@@ -163,7 +161,24 @@ Run integration tests:
 cargo test
 ```
 
-Current test status: 55 tests passing, 0 failures
+### Conformance testing
+
+How do you know this actually speaks RFC 3720? The protocol's logical rules —
+key negotiation result-functions, the login state machine, sequence-number
+windows, CHAP ordering — are modelled independently in Scryer Prolog, **derived
+from the RFC rather than from this code**. The model generates a test corpus
+(committed, so `cargo test` needs no Prolog) that is replayed against the real
+implementation, and every place the code knowingly diverges from the spec is
+recorded in an explicit deviation registry instead of being silently baked into
+the tests. The model has caught real bugs the example-based tests missed,
+including a result-function error masked at the default values.
+
+See [model/README.md](model/README.md) for the model, the deviation registry,
+and how to regenerate the corpus.
+
+On top of the conformance corpus, digest support (CRC32C header and data
+digests) has been interop-verified against a real Linux open-iscsi initiator,
+including RFC 3720 §5.2.2 preference-order selection for list offers.
 
 ## Requirements
 
@@ -190,8 +205,6 @@ Current version: 0.1.0
 - CHAP authentication: Complete (one-way and mutual)
 - Discovery sessions: Complete
 - Real-world testing: Verified with Linux initiators
-
-See [PROJECT_STATUS.md](docs/PROJECT_STATUS.md) for detailed status.
 
 ## License
 
