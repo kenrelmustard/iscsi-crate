@@ -4,7 +4,6 @@
 # Regenerate with: make -C model corpus
 #
 # Known deviations from RFC 3720 (audited, see deviation/5):
-#   D1  HeaderDigest/DataDigest: RFC says "negotiable list {None,CRC32C}, may select CRC32C"; impl "forced to None unconditionally (digest I/O path not plumbed)"  [RFC 3720 12.1; src/typestate_session.rs:296-302]
 #   D4  InitialR2T default: RFC says "default value is Yes"; impl "default value is No (deliberate immediate-data optimisation)"  [RFC 3720 12.10; src/session.rs:119]
 #
 SEQWINDOW exp=1 max=1 sn=0 expect=reject
@@ -61,9 +60,9 @@ NEGOTIATE key=DataSequenceInOrder target=Yes init=Yes rfc=Yes impl=Yes section=1
 NEGOTIATE key=DataSequenceInOrder target=Yes init=No rfc=Yes impl=Yes section=12.19 status=conform
 NEGOTIATE key=DataSequenceInOrder target=No init=Yes rfc=Yes impl=Yes section=12.19 status=conform
 NEGOTIATE key=DataSequenceInOrder target=No init=No rfc=No impl=No section=12.19 status=conform
-NEGOTIATE key=HeaderDigest target=CRC32C init=CRC32C rfc=CRC32C impl=None section=12.1 status=deviation:D1
+NEGOTIATE key=HeaderDigest target=CRC32C init=CRC32C rfc=CRC32C impl=CRC32C section=12.1 status=conform
 NEGOTIATE key=HeaderDigest target=CRC32C init=None rfc=None impl=None section=12.1 status=conform
-NEGOTIATE key=DataDigest target=CRC32C init=CRC32C rfc=CRC32C impl=None section=12.1 status=deviation:D1
+NEGOTIATE key=DataDigest target=CRC32C init=CRC32C rfc=CRC32C impl=CRC32C section=12.1 status=conform
 NEGOTIATE key=DataDigest target=CRC32C init=None rfc=None impl=None section=12.1 status=conform
 CONSTRAINT name=first_burst_le_max_burst max_burst_offer=1024 first_burst_offer=65536 expect_max=1024 expect_first=1024 rfc=valid status=conform
 DEFAULT key=InitialR2T impl_default=No rfc_default=Yes section=12.10 status=deviation:D4

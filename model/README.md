@@ -24,29 +24,24 @@ divergence is genuinely present; the registry is kept exhaustive by
 
 | ID | Subject | RFC says | Implementation does | Status |
 |----|---------|----------|---------------------|--------|
-| **D1** | HeaderDigest / DataDigest | negotiable list `{None, CRC32C}` | forced to `None` (digest I/O path not plumbed through) | **open** — deferred feature |
+| **D1** | HeaderDigest / DataDigest | negotiable list `{None, CRC32C}` | ~~forced to `None`~~ → now negotiated and plumbed through | **fixed** |
 | **D2** | FirstBurstLength | MUST NOT exceed MaxBurstLength | ~~constraint not enforced~~ → now clamped | **fixed** |
 | **D3** | DataPDUInOrder / DataSequenceInOrder | boolean result function **OR** | ~~took initiator value directly~~ → now OR | **fixed** |
 | **D4** | InitialR2T default | default is **Yes** | default is **No** | **open** — deliberate |
 
-D2 and D3 were genuine bugs and have been fixed (RFC 3720 §12.14 and
-§12.18–12.19); the model rows for them are now `conform`. The two remaining
-open deviations are documented rather than bugs:
+D1, D2 and D3 have been fixed (RFC 3720 §12.1, §12.14 and §12.18–12.19); the
+model rows for them are now `conform`. For D1, digests are negotiated
+(`src/session.rs negotiate_digest`: CRC32C whenever the initiator offers it,
+else None) and plumbed through the wire path with the tgt/open-iscsi-correct
+format: the digest is emitted little-endian (verified against fujita/tgt
+`usr/iscsi/iscsid.c`, which writes the raw u32 in native order — little-endian
+on the x86 hosts iSCSI runs on, the well-known byte-order divergence), and the
+header digest covers BHS **+ AHS** with the correct
+`BHS | AHS | HeaderDigest | Data | DataDigest` framing (`iscsi_digest`, pinned
+by `target::tests::iscsi_digest_matches_tgt_wire_format` and
+`header_digest_covers_bhs_and_ahs`). The one remaining open deviation is
+documented rather than a bug:
 
-- **D1** (RFC §12.1, `src/typestate_session.rs:296`): the CRC32C digest wire
-  path exists in `target.rs` but `read_pdu`/`write_pdu` hardcode digests off,
-  so the negotiated value is never plumbed through. The wire format itself has
-  been made tgt/open-iscsi-correct: the digest is emitted little-endian
-  (verified against fujita/tgt `usr/iscsi/iscsid.c`, which writes the raw u32
-  in native order — little-endian on the x86 hosts iSCSI runs on, the well-
-  known byte-order divergence), and the header digest now covers BHS **+ AHS**
-  with the correct `BHS | AHS | HeaderDigest | Data | DataDigest` framing
-  (`iscsi_digest`, pinned by `target::tests::iscsi_digest_matches_tgt_wire_format`
-  and `header_digest_covers_bhs_and_ahs`). What remains to close D1 is purely
-  plumbing the negotiated bool into `read_pdu`/`write_pdu` and interop-testing
-  against a real initiator; until then it stays forced to None. D1 is also the
-  root cause of the pre-existing failing unit test
-  `session::tests::test_header_digest_negotiation`, which still expects CRC32C.
 - **D4** (RFC §12.10, `src/session.rs:119`): defaulting `InitialR2T=No` enables
   unsolicited/immediate data — a deliberate, widely-interoperable optimisation.
   The value is always explicitly declared in the login response, so the

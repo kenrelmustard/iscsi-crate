@@ -192,7 +192,6 @@ fn set_param(data: &mut SessionData, key: &str, val: &str) {
 #[test]
 fn model_negotiate_matches_implementation() {
     let mut checked = 0;
-    let mut deviations = 0;
     for r in rows_of("NEGOTIATE") {
         let key = field(&r, "key");
         let target = field(&r, "target");
@@ -228,12 +227,10 @@ fn model_negotiate_matches_implementation() {
                 "NEGOTIATE {} target={} init={}: tagged {} but impl now matches RFC ({}) -- update deviation registry",
                 key, target, init, status, rfc
             );
-            deviations += 1;
         }
         checked += 1;
     }
     assert!(checked > 0, "no NEGOTIATE rows exercised");
-    assert!(deviations > 0, "expected NEGOTIATE deviation rows (D1/D3) to be exercised");
 }
 
 // ---------------------------------------------------------------------------
@@ -317,10 +314,10 @@ fn model_default_values_match() {
 fn model_deviation_registry_is_exhaustive() {
     use std::collections::BTreeSet;
 
-    // D2 (FirstBurstLength clamp) and D3 (DataPDUInOrder/DataSequenceInOrder OR)
-    // have been fixed; the remaining deviations are D1 (digests forced None,
-    // deferred feature) and D4 (InitialR2T default, deliberate).
-    let expected: BTreeSet<&str> = ["D1", "D4"].into_iter().collect();
+    // D1 (digest negotiation), D2 (FirstBurstLength clamp) and D3
+    // (DataPDUInOrder/DataSequenceInOrder OR) have been fixed; the remaining
+    // deviation is D4 (InitialR2T default, deliberate).
+    let expected: BTreeSet<&str> = ["D4"].into_iter().collect();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for r in load_corpus() {
         if let Some(status) = r.fields.get("status") {

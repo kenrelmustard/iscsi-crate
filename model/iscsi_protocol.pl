@@ -66,16 +66,15 @@ emit_corpus :-
 % deviation or a new one both force the registry to be updated.
 % ===========================================================================
 
-deviation('D1', 'HeaderDigest/DataDigest',
-          'negotiable list {None,CRC32C}, may select CRC32C',
-          'forced to None unconditionally (digest I/O path not plumbed)',
-          'RFC 3720 12.1; src/typestate_session.rs:296-302').
 deviation('D4', 'InitialR2T default',
           'default value is Yes',
           'default value is No (deliberate immediate-data optimisation)',
           'RFC 3720 12.10; src/session.rs:119').
 
 % Fixed deviations (kept for the record; no longer present in the code):
+%   D1  HeaderDigest/DataDigest now negotiated and plumbed through the wire
+%       path; CRC32C is selected whenever the initiator offers it
+%       (RFC 3720 12.1; src/session.rs negotiate_digest).
 %   D2  FirstBurstLength <= MaxBurstLength now enforced (RFC 3720 12.14).
 %   D3  DataPDUInOrder/DataSequenceInOrder now use the OR result function
 %       (RFC 3720 12.18-12.19).
@@ -189,8 +188,13 @@ impl_combine('ImmediateData',            T, O, R) :- band(T, O, R).
 impl_combine('InitialR2T',               T, O, R) :- bor(T, O, R).
 impl_combine('DataPDUInOrder',           T, O, R) :- bor(T, O, R).   % fixed: OR
 impl_combine('DataSequenceInOrder',      T, O, R) :- bor(T, O, R).   % fixed: OR
-impl_combine('HeaderDigest',             _, _, 'None').    % D1: forced None
-impl_combine('DataDigest',               _, _, 'None').    % D1: forced None
+impl_combine('HeaderDigest',             _, O, R) :- digest_select(O, R).
+impl_combine('DataDigest',               _, O, R) :- digest_select(O, R).
+
+% src/session.rs negotiate_digest/1: CRC32C whenever the offer contains it,
+% otherwise None.
+digest_select('CRC32C', 'CRC32C') :- !.
+digest_select(_, 'None').
 
 imin(A, B, A) :- A =< B, !.
 imin(_, B, B).
@@ -201,9 +205,11 @@ band(_,   _,   no).
 bor(no, no, no) :- !.
 bor(_,  _,  yes).
 
-% Which deviation a Key/result mismatch belongs to.
-dev_id('HeaderDigest',        'D1').
-dev_id('DataDigest',          'D1').
+% Which deviation a Key/result mismatch belongs to. Empty since D1 was fixed
+% (the only remaining deviation, D4, is tagged in emit_default); declared
+% dynamic so an unregistered mismatch makes neg_status fail (truncating the
+% corpus, which make check / the Rust tests then catch).
+:- dynamic(dev_id/2).
 
 % neg_case(Key, TargetValue, InitiatorOffer)
 % Numerics: target = RFC default, offers below/equal/above.
