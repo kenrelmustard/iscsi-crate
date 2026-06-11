@@ -350,6 +350,21 @@ fn handle_connection<D: ScsiBlockDevice>(
     Ok(session_entered)
 }
 
+/// Compute an iSCSI header/data digest the way tgt and Linux open-iscsi put it
+/// on the wire: standard CRC32C, emitted in little-endian byte order.
+///
+/// Interop note (verified against fujita/tgt usr/iscsi/iscsid.c): tgt writes
+/// the raw `uint32_t` digest with no `htonl()`, i.e. in *native* byte order.
+/// On the little-endian hosts where iSCSI is actually deployed that is
+/// little-endian on the wire, even though every other iSCSI field is big-
+/// endian -- the well-known digest byte-order divergence. We emit little-endian
+/// explicitly, which matches tgt/open-iscsi on x86 and is also correct on a
+/// big-endian host (where tgt's native order would be wrong). The CRC32C value
+/// uses the standard init/final inversion, already applied by the crc32c crate.
+fn iscsi_digest(bytes: &[u8]) -> [u8; 4] {
+    crc32c::crc32c(bytes).to_le_bytes()
+}
+
 /// Read a PDU from the TCP stream with optional digest verification
 fn read_pdu(stream: &mut TcpStream) -> ScsiResult<IscsiPdu> {
     read_pdu_digest(stream, false, false)
@@ -359,41 +374,48 @@ fn read_pdu_digest(stream: &mut TcpStream, header_digest: bool, data_digest: boo
     let mut bhs = [0u8; BHS_SIZE];
     stream.read_exact(&mut bhs).map_err(IscsiError::Io)?;
 
-    // Read and verify header digest if enabled
-    if header_digest {
-        let mut hd = [0u8; 4];
-        stream.read_exact(&mut hd).map_err(IscsiError::Io)?;
-        let expected = u32::from_le_bytes(hd);
-        let actual = crc32c::crc32c(&bhs);
-        if expected != actual {
-            log::error!("Header digest mismatch: expected 0x{:08x}, got 0x{:08x}", expected, actual);
-            return Err(IscsiError::Protocol("Header digest mismatch".to_string()));
-        }
-    }
-
     let ahs_length = bhs[4] as usize * 4;
     let data_length = ((bhs[5] as u32) << 16) | ((bhs[6] as u32) << 8) | (bhs[7] as u32);
     let padded_data_len = (data_length as usize).div_ceil(4) * 4;
 
-    let total_len = BHS_SIZE + ahs_length + padded_data_len;
-    let mut full_pdu = vec![0u8; total_len];
-    full_pdu[..BHS_SIZE].copy_from_slice(&bhs);
-
-    if total_len > BHS_SIZE {
-        stream.read_exact(&mut full_pdu[BHS_SIZE..]).map_err(IscsiError::Io)?;
+    // Read the AHS, which sits between the BHS and the header digest on the
+    // wire (BHS | AHS | HeaderDigest | Data | DataDigest).
+    let mut header = vec![0u8; BHS_SIZE + ahs_length];
+    header[..BHS_SIZE].copy_from_slice(&bhs);
+    if ahs_length > 0 {
+        stream.read_exact(&mut header[BHS_SIZE..]).map_err(IscsiError::Io)?;
     }
 
-    // Read and verify data digest if enabled and there's data
+    // Header digest covers the BHS *and* AHS (RFC 3720 10.2.1; matches tgt).
+    if header_digest {
+        let mut hd = [0u8; 4];
+        stream.read_exact(&mut hd).map_err(IscsiError::Io)?;
+        let expected = iscsi_digest(&header);
+        if hd != expected {
+            log::error!("Header digest mismatch: expected {:02x?}, got {:02x?}", expected, hd);
+            return Err(IscsiError::Protocol("Header digest mismatch".to_string()));
+        }
+    }
+
+    // Read the padded data segment.
+    let mut data = vec![0u8; padded_data_len];
+    if padded_data_len > 0 {
+        stream.read_exact(&mut data).map_err(IscsiError::Io)?;
+    }
+
+    // Data digest covers the padded data only.
     if data_digest && padded_data_len > 0 {
         let mut dd = [0u8; 4];
         stream.read_exact(&mut dd).map_err(IscsiError::Io)?;
-        let expected = u32::from_le_bytes(dd);
-        let actual = crc32c::crc32c(&full_pdu[BHS_SIZE + ahs_length..]);
-        if expected != actual {
-            log::error!("Data digest mismatch: expected 0x{:08x}, got 0x{:08x}", expected, actual);
+        let expected = iscsi_digest(&data);
+        if dd != expected {
+            log::error!("Data digest mismatch: expected {:02x?}, got {:02x?}", expected, dd);
             return Err(IscsiError::Protocol("Data digest mismatch".to_string()));
         }
     }
+
+    let mut full_pdu = header;
+    full_pdu.extend_from_slice(&data);
 
     let pdu = IscsiPdu::from_bytes(&full_pdu)?;
 
@@ -416,24 +438,25 @@ fn write_pdu_digest(stream: &mut TcpStream, pdu: &IscsiPdu, header_digest: bool,
         log::debug!("Sending PDU header hex: {}", bytes[0..48].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" "));
     }
 
-    // Write BHS
-    stream.write_all(&bytes[..BHS_SIZE]).map_err(IscsiError::Io)?;
+    // BHS | AHS | HeaderDigest | Data | DataDigest.
+    let header_end = BHS_SIZE + (bytes[4] as usize) * 4;
 
-    // Write header digest if enabled
+    // Write BHS + AHS.
+    stream.write_all(&bytes[..header_end]).map_err(IscsiError::Io)?;
+
+    // Header digest covers the BHS + AHS.
     if header_digest {
-        let crc = crc32c::crc32c(&bytes[..BHS_SIZE]);
-        stream.write_all(&crc.to_le_bytes()).map_err(IscsiError::Io)?;
+        stream.write_all(&iscsi_digest(&bytes[..header_end])).map_err(IscsiError::Io)?;
     }
 
-    // Write rest (AHS + data)
-    if bytes.len() > BHS_SIZE {
-        stream.write_all(&bytes[BHS_SIZE..]).map_err(IscsiError::Io)?;
+    // Write the padded data segment.
+    if bytes.len() > header_end {
+        stream.write_all(&bytes[header_end..]).map_err(IscsiError::Io)?;
     }
 
-    // Write data digest if enabled and there's data
-    if data_digest && bytes.len() > BHS_SIZE {
-        let crc = crc32c::crc32c(&bytes[BHS_SIZE..]);
-        stream.write_all(&crc.to_le_bytes()).map_err(IscsiError::Io)?;
+    // Data digest covers the padded data only.
+    if data_digest && bytes.len() > header_end {
+        stream.write_all(&iscsi_digest(&bytes[header_end..])).map_err(IscsiError::Io)?;
     }
 
     stream.flush().map_err(IscsiError::Io)?;
@@ -1988,6 +2011,37 @@ impl IscsiServerBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pin the iSCSI digest value and wire byte order against tgt / open-iscsi.
+    ///
+    /// 0xE3069283 is the standard check value for CRC-32C (the CRC catalogue
+    /// literally names this parameterisation "CRC-32/ISCSI"): the CRC of the
+    /// ASCII string "123456789". tgt emits the raw u32 in native byte order,
+    /// which on the LE hosts iSCSI runs on is little-endian — so the on-wire
+    /// digest bytes must be the value little-endian.
+    #[test]
+    fn iscsi_digest_matches_tgt_wire_format() {
+        assert_eq!(crc32c::crc32c(b"123456789"), 0xE306_9283);
+        assert_eq!(iscsi_digest(b"123456789"), [0x83, 0x92, 0x06, 0xE3]);
+    }
+
+    /// The header digest must cover the BHS *and* the AHS (RFC 3720 10.2.1;
+    /// matches tgt's `crc32c(bhs); if (ahssize) crc32c(ahs)`). Verify that
+    /// extending the covered bytes with an AHS changes the digest, i.e. the
+    /// AHS is genuinely included rather than ignored.
+    #[test]
+    fn header_digest_covers_bhs_and_ahs() {
+        let bhs = [0xABu8; BHS_SIZE];
+        let mut bhs_plus_ahs = bhs.to_vec();
+        bhs_plus_ahs.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]); // one 4-byte AHS
+
+        let d_bhs_only = iscsi_digest(&bhs);
+        let d_with_ahs = iscsi_digest(&bhs_plus_ahs);
+        assert_ne!(
+            d_bhs_only, d_with_ahs,
+            "header digest must include the AHS, not just the BHS"
+        );
+    }
 
     struct MockDevice {
         capacity: u64,
