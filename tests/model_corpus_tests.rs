@@ -317,7 +317,10 @@ fn model_default_values_match() {
 fn model_deviation_registry_is_exhaustive() {
     use std::collections::BTreeSet;
 
-    let expected: BTreeSet<&str> = ["D1", "D2", "D3", "D4"].into_iter().collect();
+    // D2 (FirstBurstLength clamp) and D3 (DataPDUInOrder/DataSequenceInOrder OR)
+    // have been fixed; the remaining deviations are D1 (digests forced None,
+    // deferred feature) and D4 (InitialR2T default, deliberate).
+    let expected: BTreeSet<&str> = ["D1", "D4"].into_iter().collect();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for r in load_corpus() {
         if let Some(status) = r.fields.get("status") {

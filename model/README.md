@@ -22,19 +22,28 @@ The corpus tags affected rows `status=deviation:Dn`, and the tests assert each
 divergence is genuinely present; the registry is kept exhaustive by
 `model_deviation_registry_is_exhaustive`.
 
-| ID | Subject | RFC says | Implementation does | Reference |
-|----|---------|----------|---------------------|-----------|
-| **D1** | HeaderDigest / DataDigest | negotiable list `{None, CRC32C}` | forced to `None` unconditionally | RFC 3720 §12.1; `src/typestate_session.rs:291` |
-| **D2** | FirstBurstLength | MUST NOT exceed MaxBurstLength | cross-key constraint not enforced | RFC 3720 §12.14; `src/typestate_session.rs:254` |
-| **D3** | DataPDUInOrder / DataSequenceInOrder | boolean result function **OR** against the target value | takes the initiator's value directly | RFC 3720 §12.18–12.19; `src/typestate_session.rs:274` |
-| **D4** | InitialR2T default | default is **Yes** | default is **No** | RFC 3720 §12.10; `src/session.rs:119` |
+| ID | Subject | RFC says | Implementation does | Status |
+|----|---------|----------|---------------------|--------|
+| **D1** | HeaderDigest / DataDigest | negotiable list `{None, CRC32C}` | forced to `None` (digest I/O path not plumbed through) | **open** — deferred feature |
+| **D2** | FirstBurstLength | MUST NOT exceed MaxBurstLength | ~~constraint not enforced~~ → now clamped | **fixed** |
+| **D3** | DataPDUInOrder / DataSequenceInOrder | boolean result function **OR** | ~~took initiator value directly~~ → now OR | **fixed** |
+| **D4** | InitialR2T default | default is **Yes** | default is **No** | **open** — deliberate |
 
-D1 is documented in the code (CRC32C disabled until tested) and is the root
-cause of the pre-existing failing unit test `session::tests::test_header_digest_negotiation`,
-which still expects CRC32C. D2 is a genuine conformance gap. D3 is masked at
-the default (Yes) but wrong whenever a target starts from a different value.
-D4 is a deliberate optimisation (allow unsolicited data) but still a deviation
-from the RFC default. None are fixed by this change — they are *surfaced*.
+D2 and D3 were genuine bugs and have been fixed (RFC 3720 §12.14 and
+§12.18–12.19); the model rows for them are now `conform`. The two remaining
+open deviations are documented rather than bugs:
+
+- **D1** (RFC §12.1, `src/typestate_session.rs:296`): the CRC32C digest wire
+  path exists in `target.rs` but `read_pdu`/`write_pdu` hardcode digests off,
+  so the negotiated value is never plumbed through. Enabling CRC32C in
+  negotiation without plumbing it would corrupt every connection — hence it is
+  a deferred, interop-tested feature, not a quick fix. D1 is also the root
+  cause of the pre-existing failing unit test
+  `session::tests::test_header_digest_negotiation`, which still expects CRC32C.
+- **D4** (RFC §12.10, `src/session.rs:119`): defaulting `InitialR2T=No` enables
+  unsolicited/immediate data — a deliberate, widely-interoperable optimisation.
+  The value is always explicitly declared in the login response, so the
+  negotiation is RFC-conformant despite the differing default.
 
 ## Files
 

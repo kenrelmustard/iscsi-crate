@@ -4,10 +4,8 @@
 # Regenerate with: make -C model corpus
 #
 # Known deviations from RFC 3720 (audited, see deviation/5):
-#   D1  HeaderDigest/DataDigest: RFC says "negotiable list {None,CRC32C}, may select CRC32C"; impl "forced to None unconditionally"  [RFC 3720 12.1; src/typestate_session.rs:291-297]
-#   D2  FirstBurstLength: RFC says "MUST NOT exceed MaxBurstLength"; impl "cross-key constraint not enforced"  [RFC 3720 12.14; src/typestate_session.rs:254-258]
-#   D3  DataPDUInOrder/DataSequenceInOrder: RFC says "boolean result function OR against target value"; impl "takes initiator value directly (ignores target/default)"  [RFC 3720 12.18-12.19; src/typestate_session.rs:274-279]
-#   D4  InitialR2T default: RFC says "default value is Yes"; impl "default value is No"  [RFC 3720 12.10; src/session.rs:119]
+#   D1  HeaderDigest/DataDigest: RFC says "negotiable list {None,CRC32C}, may select CRC32C"; impl "forced to None unconditionally (digest I/O path not plumbed)"  [RFC 3720 12.1; src/typestate_session.rs:296-302]
+#   D4  InitialR2T default: RFC says "default value is Yes"; impl "default value is No (deliberate immediate-data optimisation)"  [RFC 3720 12.10; src/session.rs:119]
 #
 SEQWINDOW exp=1 max=1 sn=0 expect=reject
 SEQWINDOW exp=1 max=1 sn=1 expect=accept
@@ -56,18 +54,18 @@ NEGOTIATE key=ImmediateData target=Yes init=No rfc=No impl=No section=12.11 stat
 NEGOTIATE key=ImmediateData target=No init=Yes rfc=No impl=No section=12.11 status=conform
 NEGOTIATE key=ImmediateData target=No init=No rfc=No impl=No section=12.11 status=conform
 NEGOTIATE key=DataPDUInOrder target=Yes init=Yes rfc=Yes impl=Yes section=12.18 status=conform
-NEGOTIATE key=DataPDUInOrder target=Yes init=No rfc=Yes impl=No section=12.18 status=deviation:D3
+NEGOTIATE key=DataPDUInOrder target=Yes init=No rfc=Yes impl=Yes section=12.18 status=conform
 NEGOTIATE key=DataPDUInOrder target=No init=Yes rfc=Yes impl=Yes section=12.18 status=conform
 NEGOTIATE key=DataPDUInOrder target=No init=No rfc=No impl=No section=12.18 status=conform
 NEGOTIATE key=DataSequenceInOrder target=Yes init=Yes rfc=Yes impl=Yes section=12.19 status=conform
-NEGOTIATE key=DataSequenceInOrder target=Yes init=No rfc=Yes impl=No section=12.19 status=deviation:D3
+NEGOTIATE key=DataSequenceInOrder target=Yes init=No rfc=Yes impl=Yes section=12.19 status=conform
 NEGOTIATE key=DataSequenceInOrder target=No init=Yes rfc=Yes impl=Yes section=12.19 status=conform
 NEGOTIATE key=DataSequenceInOrder target=No init=No rfc=No impl=No section=12.19 status=conform
 NEGOTIATE key=HeaderDigest target=CRC32C init=CRC32C rfc=CRC32C impl=None section=12.1 status=deviation:D1
 NEGOTIATE key=HeaderDigest target=CRC32C init=None rfc=None impl=None section=12.1 status=conform
 NEGOTIATE key=DataDigest target=CRC32C init=CRC32C rfc=CRC32C impl=None section=12.1 status=deviation:D1
 NEGOTIATE key=DataDigest target=CRC32C init=None rfc=None impl=None section=12.1 status=conform
-CONSTRAINT name=first_burst_le_max_burst max_burst_offer=1024 first_burst_offer=65536 expect_max=1024 expect_first=65536 rfc=invalid status=deviation:D2
+CONSTRAINT name=first_burst_le_max_burst max_burst_offer=1024 first_burst_offer=65536 expect_max=1024 expect_first=1024 rfc=valid status=conform
 DEFAULT key=InitialR2T impl_default=No rfc_default=Yes section=12.10 status=deviation:D4
 DEFAULT key=ImmediateData impl_default=Yes rfc_default=Yes section=12.11 status=conform
 DEFAULT key=MaxBurstLength impl_default=262144 rfc_default=262144 section=12.13 status=conform

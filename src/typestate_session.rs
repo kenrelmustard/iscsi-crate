@@ -249,11 +249,19 @@ impl SessionData {
             "MaxBurstLength" => {
                 if let Ok(v) = value.parse::<u32>() {
                     self.params.max_burst_length = v.min(self.params.max_burst_length);
+                    // RFC 3720 12.14: FirstBurstLength MUST NOT exceed MaxBurstLength.
+                    // Re-clamp in case MaxBurstLength is negotiated after FirstBurstLength.
+                    self.params.first_burst_length =
+                        self.params.first_burst_length.min(self.params.max_burst_length);
                 }
             }
             "FirstBurstLength" => {
                 if let Ok(v) = value.parse::<u32>() {
-                    self.params.first_burst_length = v.min(self.params.first_burst_length);
+                    // RFC 3720 12.14: Minimum result function, and the negotiated
+                    // value MUST NOT exceed MaxBurstLength.
+                    self.params.first_burst_length = v
+                        .min(self.params.first_burst_length)
+                        .min(self.params.max_burst_length);
                 }
             }
             "DefaultTime2Wait" => {
@@ -272,10 +280,14 @@ impl SessionData {
                 }
             }
             "DataPDUInOrder" => {
-                self.params.data_pdu_in_order = value == "Yes";
+                // RFC 3720 12.18: boolean result function OR against our value.
+                self.params.data_pdu_in_order =
+                    self.params.data_pdu_in_order || (value == "Yes");
             }
             "DataSequenceInOrder" => {
-                self.params.data_sequence_in_order = value == "Yes";
+                // RFC 3720 12.19: boolean result function OR against our value.
+                self.params.data_sequence_in_order =
+                    self.params.data_sequence_in_order || (value == "Yes");
             }
             "ErrorRecoveryLevel" => {
                 if let Ok(v) = value.parse::<u8>() {

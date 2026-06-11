@@ -68,20 +68,17 @@ emit_corpus :-
 
 deviation('D1', 'HeaderDigest/DataDigest',
           'negotiable list {None,CRC32C}, may select CRC32C',
-          'forced to None unconditionally',
-          'RFC 3720 12.1; src/typestate_session.rs:291-297').
-deviation('D2', 'FirstBurstLength',
-          'MUST NOT exceed MaxBurstLength',
-          'cross-key constraint not enforced',
-          'RFC 3720 12.14; src/typestate_session.rs:254-258').
-deviation('D3', 'DataPDUInOrder/DataSequenceInOrder',
-          'boolean result function OR against target value',
-          'takes initiator value directly (ignores target/default)',
-          'RFC 3720 12.18-12.19; src/typestate_session.rs:274-279').
+          'forced to None unconditionally (digest I/O path not plumbed)',
+          'RFC 3720 12.1; src/typestate_session.rs:296-302').
 deviation('D4', 'InitialR2T default',
           'default value is Yes',
-          'default value is No',
+          'default value is No (deliberate immediate-data optimisation)',
           'RFC 3720 12.10; src/session.rs:119').
+
+% Fixed deviations (kept for the record; no longer present in the code):
+%   D2  FirstBurstLength <= MaxBurstLength now enforced (RFC 3720 12.14).
+%   D3  DataPDUInOrder/DataSequenceInOrder now use the OR result function
+%       (RFC 3720 12.18-12.19).
 
 emit_deviation_legend :-
     format("# Known deviations from RFC 3720 (audited, see deviation/5):~n", []),
@@ -190,8 +187,8 @@ impl_combine('ErrorRecoveryLevel',       T, O, R) :- imin(T, O, R).
 impl_combine('MaxRecvDataSegmentLength', _, O, O).
 impl_combine('ImmediateData',            T, O, R) :- band(T, O, R).
 impl_combine('InitialR2T',               T, O, R) :- bor(T, O, R).
-impl_combine('DataPDUInOrder',           _, O, O).         % D3: ignores target
-impl_combine('DataSequenceInOrder',      _, O, O).         % D3: ignores target
+impl_combine('DataPDUInOrder',           T, O, R) :- bor(T, O, R).   % fixed: OR
+impl_combine('DataSequenceInOrder',      T, O, R) :- bor(T, O, R).   % fixed: OR
 impl_combine('HeaderDigest',             _, _, 'None').    % D1: forced None
 impl_combine('DataDigest',               _, _, 'None').    % D1: forced None
 
@@ -207,8 +204,6 @@ bor(_,  _,  yes).
 % Which deviation a Key/result mismatch belongs to.
 dev_id('HeaderDigest',        'D1').
 dev_id('DataDigest',          'D1').
-dev_id('DataPDUInOrder',      'D3').
-dev_id('DataSequenceInOrder', 'D3').
 
 % neg_case(Key, TargetValue, InitiatorOffer)
 % Numerics: target = RFC default, offers below/equal/above.
@@ -270,21 +265,21 @@ token(X,   X).
 % ===========================================================================
 % Layer 2b: Cross-key constraint  (RFC 3720 12.14)
 %
-% "FirstBurstLength MUST NOT exceed MaxBurstLength." Generate a negotiation
-% that drives the implementation into a state that violates this (the impl
-% applies the per-key Minimum but never the cross-key constraint), so the
-% test can assert the violation is reachable -> deviation D2.
+% "FirstBurstLength MUST NOT exceed MaxBurstLength." The implementation now
+% enforces this (formerly deviation D2). The expected values are computed from
+% the per-key Minimum plus the clamp, and the result must satisfy the
+% constraint (first =< max).
 % ===========================================================================
 
-% constraint_case(Name, MaxBurstOffer, FirstBurstOffer, ExpectMax, ExpectFirst)
-% With target defaults 262144 / 65536: max = min(262144,1024)=1024,
-% first = min(65536,65536)=65536  ->  first (65536) > max (1024): violation.
-constraint_case(first_burst_le_max_burst, 1024, 65536, 1024, 65536).
+% constraint_case(Name, MaxBurstOffer, FirstBurstOffer): defaults 262144/65536.
+constraint_case(first_burst_le_max_burst, 1024, 65536).
 
 emit_constraint :-
-    forall(constraint_case(Name, MBO, FBO, EMax, EFirst),
-           ( ( EFirst =< EMax -> Rfc = valid ; Rfc = invalid ),
-             ( Rfc == invalid -> dev_status('D2', Status) ; Status = conform ),
+    forall(constraint_case(Name, MBO, FBO),
+           ( imin(262144, MBO, EMax),
+             imin(65536, FBO, F1), imin(F1, EMax, EFirst),
+             ( EFirst =< EMax -> Rfc = valid ; Rfc = invalid ),
+             ( Rfc == valid -> Status = conform ; dev_status('D2', Status) ),
              format("CONSTRAINT name=~w max_burst_offer=~w first_burst_offer=~w expect_max=~w expect_first=~w rfc=~w status=~w~n",
                     [Name, MBO, FBO, EMax, EFirst, Rfc, Status]) )).
 
