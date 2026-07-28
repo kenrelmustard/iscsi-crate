@@ -47,3 +47,11 @@ path = "examples/chap_target.rs"
 [[example]]
 name = "mutual_chap_target"
 path = "examples/mutual_chap_target.rs"
+
+[[example]]
+name = "windows_physical_disk"
+path = "examples/windows_physical_disk.rs"
+
+[[example]]
+name = "linux_physical_disk"
+path = "examples/linux_physical_disk.rs"

@@ -55,11 +55,21 @@ pub mod session;
 pub mod target;
 pub mod typestate_session;
 
+#[cfg(target_os = "windows")]
+pub mod windows_disk;
+
+#[cfg(target_os = "linux")]
+pub mod linux_disk;
+
 pub use auth::{AuthConfig, ChapCredentials};
 pub use client::IscsiClient;
 pub use error::{IscsiError, ScsiResult};
 pub use scsi::ScsiBlockDevice;
 pub use target::{IscsiTarget, IscsiTargetBuilder, IscsiServer, IscsiServerBuilder};
+#[cfg(target_os = "windows")]
+pub use windows_disk::WindowsPhysicalDisk;
+#[cfg(target_os = "linux")]
+pub use linux_disk::LinuxPhysicalDisk;
 
 /// Version of this library
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

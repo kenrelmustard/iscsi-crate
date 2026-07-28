@@ -13,7 +13,7 @@ A pure Rust iSCSI target implementation for building custom storage solutions.
 - **CHAP Authentication**: One-way and mutual CHAP support for secure connections
 - **Discovery Sessions**: SendTargets protocol for target discovery
 - **Write Operations**: Immediate data and multi-PDU Data-Out support
-- **Real-World Tested**: Verified with Linux open-iscsi and iscsiadm, including CRC32C header/data digest interop
+- **Real-World Tested**: Verified with Linux open-iscsi and Windows iSCSI Initiator, including CRC32C header/data digest interop
 - **RFC-Conformance Tested**: Corpus-driven tests generated from an independent Prolog model of RFC 3720, with an explicit registry of every known deviation from the spec
 - **Builder Pattern API**: Easy configuration and setup
 
@@ -93,6 +93,46 @@ sudo mkfs.ext4 /dev/sdb
 sudo mount /dev/sdb /mnt/iscsi
 ```
 
+## Connecting from Windows
+
+Use the Windows iSCSI Initiator or `iscsicli` utility to connect to the target.
+
+```powershell
+# Add the target portal
+iscsicli AddTargetPortal 127.0.0.1 3260
+
+# List discovered targets
+iscsicli ListTargets
+
+# Login to target
+iscsicli QLoginTarget iqn.2025-12.local:storage.disk1
+
+# Logout from target
+iscsicli QLogoutTarget iqn.2025-12.local:storage.disk1
+```
+```
+
+In the Windows iSCSI Initiator app, add portal `127.0.0.1:3260`, then connect to the target and enable CHAP if required.
+## Connecting from Windows
+
+Use the Windows iSCSI Initiator or the `iscsicli` utility to connect:
+
+```powershell
+# Add the target portal
+iscsicli AddTargetPortal 127.0.0.1 3260
+
+# List discovered targets
+iscsicli ListTargets
+
+# Login to target
+iscsicli QLoginTarget iqn.2025-12.local:storage.disk1
+
+# Logout from target
+iscsicli QLogoutTarget iqn.2025-12.local:storage.disk1
+```
+
+Alternatively, open the Windows iSCSI Initiator app, add portal `127.0.0.1:3260`, then connect to the target and enable CHAP if required.
+
 ## Examples
 
 The `examples/` directory contains several examples:
@@ -100,6 +140,8 @@ The `examples/` directory contains several examples:
 - **simple_target.rs** - Basic in-memory storage target
 - **chap_target.rs** - One-way CHAP authentication example
 - **mutual_chap_target.rs** - Mutual CHAP authentication example
+- **windows_physical_disk.rs** - Windows physical disk target example
+- **linux_physical_disk.rs** - Linux physical disk target example
 - **discover_targets.rs** - Discovery session client
 - **graceful_shutdown.rs** - Handling shutdown signals
 - **inspect_pdu_serialization.rs** - PDU serialization debugging tool
@@ -108,6 +150,46 @@ Run an example:
 
 ```bash
 cargo run --example simple_target
+```
+
+## Windows physical disk support
+
+On Windows, you can back the iSCSI target with a physical disk device such as `\\.\\PhysicalDrive0` using the `WindowsPhysicalDisk` helper. For disks that are already in use by the OS, open them read-only to avoid unsafe concurrent access.
+
+```rust
+use iscsi_target::{IscsiTarget, ScsiBlockDevice, WindowsPhysicalDisk};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let storage = WindowsPhysicalDisk::open_read_only(r"\\.\\PhysicalDrive0", 512)?;
+
+    let target = IscsiTarget::builder()
+        .bind_addr("0.0.0.0:3260")
+        .target_name("iqn.2026-07.com.example:windows-disk")
+        .build(storage)?;
+
+    target.run()?;
+    Ok(())
+}
+```
+
+## Linux physical disk support
+
+On Linux, you can back the iSCSI target with a block device such as `/dev/sda` using the `LinuxPhysicalDisk` helper. Use `open_read_only` for safe read-only access.
+
+```rust
+use iscsi_target::{IscsiTarget, ScsiBlockDevice, LinuxPhysicalDisk};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let storage = LinuxPhysicalDisk::open_read_only("/dev/sda", 512)?;
+
+    let target = IscsiTarget::builder()
+        .bind_addr("0.0.0.0:3260")
+        .target_name("iqn.2026-07.com.example:linux-physical-disk")
+        .build(storage)?;
+
+    target.run()?;
+    Ok(())
+}
 ```
 
 ## CHAP Authentication
@@ -183,9 +265,27 @@ including RFC 3720 §5.2.2 preference-order selection for list offers.
 ## Requirements
 
 - Rust 1.82 or later (2021 edition)
-- Linux (for testing with open-iscsi)
+- Cross-platform support for Windows and Linux using the Rust standard library networking APIs
 - Standard iSCSI port 3260 (or use custom port)
+## Windows physical disk support
 
+On Windows, you can back the iSCSI target with a physical disk device such as `\\.\\PhysicalDrive0` by implementing `ScsiBlockDevice` with the `WindowsPhysicalDisk` helper. Use `open_read_only` for any disk that is already in use by the OS.
+
+```rust
+use iscsi_target::{IscsiTarget, ScsiBlockDevice, WindowsPhysicalDisk};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let storage = WindowsPhysicalDisk::open_read_only(r"\\.\\PhysicalDrive0", 512)?;
+
+    let target = IscsiTarget::builder()
+        .bind_addr("0.0.0.0:3260")
+        .target_name("iqn.2026-07.com.example:windows-disk")
+        .build(storage)?;
+
+    target.run()?;
+    Ok(())
+}
+```
 ## Dependencies
 
 - `byteorder` - Binary protocol parsing

@@ -113,8 +113,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nTo connect from Linux:");
     println!("  sudo iscsiadm -m discovery -t sendtargets -p 127.0.0.1:{}", port);
     println!("  sudo iscsiadm -m node -T iqn.2025-12.local:storage.memory-disk -p 127.0.0.1:{} --login", port);
+    println!("\nTo connect from Windows:");
+    println!("  iscsicli AddTargetPortal 127.0.0.1 {}", port);
+    println!("  iscsicli ListTargets");
+    println!("  iscsicli QLoginTarget iqn.2025-12.local:storage.memory-disk");
     println!("\nTo disconnect:");
-    println!("  sudo iscsiadm -m node -T iqn.2025-12.local:storage.memory-disk -p 127.0.0.1:{} --logout", port);
+    println!("  iscsicli QLogoutTarget iqn.2025-12.local:storage.memory-disk");
     println!("\nStarting iSCSI target server...\n");
 
     // Run the target
